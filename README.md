@@ -150,3 +150,9 @@ The system is configured via environment variables in the `.env` file:
 If you are running the server behind a NAT with only one open port, you can leverage Cloudflare's **Origin Rules** to route standard HTTPS traffic (port 443) to your custom open port. 
 
 For detailed step-by-step instructions on configuring Cloudflare and setting up `.env` for NAT, please refer to the **[NAT & Cloudflare Guide in TROUBLESHOOTING.md](TROUBLESHOOTING.md#3-nat--single-port-deployment-via-cloudflare)**.
+
+---
+
+## 💖 Inspiration & Credits
+
+This project was inspired by and built upon the excellent work of the **[oaitt](https://github.com/haiodo/oaitt)** repository. Special thanks to the original creators for laying down the foundation for high-performance speech transcription and orchestration!
