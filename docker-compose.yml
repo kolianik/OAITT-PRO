@@ -1,0 +1,128 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: oaitt-postgres
+    restart: always
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-transcribe_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-transcribe_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway-orchestrator:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: oaitt-gateway
+    restart: always
+    ports:
+      - "${GATEWAY_PORT:-9000}:9000"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-transcribe_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_pass}
+      - ADMIN_KEY=${ADMIN_KEY:-admin-secret-key}
+      - WHISPERX_URL=http://whisperx-service:9007
+      - GIGAAM_URL=http://gigaam-service:9007
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  whisperx-service:
+    build:
+      context: ./whisperx
+      dockerfile: Dockerfile
+    container_name: oaitt-whisperx
+    restart: always
+    environment:
+      - DEVICE=${DEVICE:-cuda}
+      - COMPUTE_TYPE=${WHISPERX_COMPUTE_TYPE:-float16}
+      - WHISPERX_MODEL=${WHISPERX_MODEL:-bzikst/faster-whisper-large-v3-russian}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - model_cache:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  gigaam-service:
+    build:
+      context: .
+      dockerfile: ./gigaam/Dockerfile
+    container_name: oaitt-gigaam
+    restart: always
+    environment:
+      - DEVICE=${DEVICE:-cuda}
+      - GIGAAM_MODEL=${GIGAAM_MODEL:-v3_e2e_rnnt}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - model_cache:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  front-proxy:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: oaitt-proxy
+    restart: always
+    ports:
+      - "${PROXY_PORT_HTTPS:-443}:443"
+      - "${PROXY_PORT_HTTP:-80}:80"
+    volumes:
+      - certs:/etc/letsencrypt
+    depends_on:
+      - gateway-orchestrator
+
+  certbot:
+    image: certbot/dns-cloudflare
+    container_name: oaitt-certbot
+    restart: always
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - DOMAIN_NAME=${DOMAIN_NAME}
+      - EMAIL=${EMAIL}
+    volumes:
+      - certs:/etc/letsencrypt
+    entrypoint: >
+      /bin/sh -c "
+      if [ -z \"$${CLOUDFLARE_API_TOKEN}\" ] || [ -z \"$${DOMAIN_NAME}\" ] || [ -z \"$${EMAIL}\" ]; then
+        echo 'Cloudflare credentials or Domain/Email missing. Certbot will sleep.';
+        while :; do sleep 3600; done;
+      fi;
+      mkdir -p /root/.secrets &&
+      echo 'dns_cloudflare_api_token = '$${CLOUDFLARE_API_TOKEN} > /root/.secrets/cloudflare.ini &&
+      chmod 600 /root/.secrets/cloudflare.ini &&
+      if [ ! -f /etc/letsencrypt/active ]; then
+        echo 'Acquiring real SSL wildcard certificate from Let\'s Encrypt...';
+        certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini --agree-tos --email $${EMAIL} -d $${DOMAIN_NAME} -d *.$${DOMAIN_NAME} --non-interactive --cert-name transcribe &&
+        touch /etc/letsencrypt/active;
+      fi;
+      while :; do
+        certbot renew --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini;
+        sleep 24h & wait $${!};
+      done"
+
+volumes:
+  pgdata:
+  certs:
+  model_cache:
