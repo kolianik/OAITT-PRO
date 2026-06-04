@@ -69,7 +69,8 @@ def load_models_if_needed():
             WHISPER_MODEL_NAME,
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
-            download_root="/app/data"
+            download_root="/app/data",
+            local_files_only=True
         )
         logger.info("WhisperX model loaded successfully")
         
@@ -83,14 +84,14 @@ def load_models_if_needed():
 
 def load_diarize_pipeline_if_needed():
     global diarize_pipeline
-    import whisperx
     
     if diarize_pipeline is None:
         if not HF_TOKEN:
             raise ValueError("HF_TOKEN is required for Pyannote Diarization")
         logger.info("Loading Pyannote Diarization Pipeline (pyannote/speaker-diarization-community-1)...")
-        diarize_pipeline = whisperx.DiarizationPipeline(
-            use_auth_token=HF_TOKEN,
+        from whisperx.diarize import DiarizationPipeline
+        diarize_pipeline = DiarizationPipeline(
+            token=HF_TOKEN,
             device=DEVICE
         )
         logger.info("Diarization pipeline loaded successfully")
@@ -116,6 +117,114 @@ async def unload_models():
     logger.info("Models successfully unloaded and GPU memory freed")
     return {"status": "unloaded"}
 
+def process_transcription_from_file(
+    file_path: str,
+    language: Optional[str],
+    response_format: str,
+    diarize: str
+) -> dict:
+    import whisperx
+    should_diarize = diarize.lower() == "true"
+    
+    # Load models
+    load_models_if_needed()
+    
+    # 2. Load audio and transcribe
+    logger.info("Loading audio file into WhisperX...")
+    audio = whisperx.load_audio(file_path)
+    duration_seconds = len(audio) / 16000.0  # WhisperX audio is loaded at 16000Hz
+    
+    logger.info(f"Running WhisperX transcription (duration: {duration_seconds:.2f}s)...")
+    
+    # Run WhisperX transcription
+    transcribe_args = {}
+    if language and language != "None" and language != "":
+        transcribe_args["language"] = language
+        
+    # Reduce batch_size to 4 to prevent CUDA Out Of Memory (OOM) on large/long files (>1 hour)
+    result = whisper_model.transcribe(audio, batch_size=4, **transcribe_args)
+    detected_lang = result.get("language", "ru")
+    
+    # 3. Align transcription segments
+    logger.info("Running word-level alignment...")
+    aligned_result = whisperx.align(
+        result["segments"],
+        align_model,
+        align_metadata,
+        audio,
+        device=DEVICE,
+        return_char_alignments=False
+    )
+    
+    # 4. Optional Diarization
+    if should_diarize:
+        load_diarize_pipeline_if_needed()
+        logger.info("Running Pyannote speaker diarization...")
+        diarize_segments = diarize_pipeline(audio)
+        
+        logger.info("Assigning speakers to segments and words...")
+        # Assign speaker labels to alignment segments
+        aligned_result = whisperx.assign_word_speakers(diarize_segments, aligned_result)
+        
+    # 5. Format to consistent return structure
+    output_segments = []
+    for idx, seg in enumerate(aligned_result.get("segments", [])):
+        # Fallback values
+        start_time = float(seg.get("start", 0.0))
+        end_time = float(seg.get("end", start_time))
+        text = seg.get("text", "").strip()
+        speaker = seg.get("speaker", None)
+        
+        output_segments.append({
+            "id": idx,
+            "start": start_time,
+            "end": end_time,
+            "text": text,
+            "speaker": speaker,
+            "avg_logprob": seg.get("avg_logprob", 0.0),
+            "words": [
+                {
+                    "word": w.get("word", ""),
+                    "start": w.get("start", 0.0),
+                    "end": w.get("end", 0.0),
+                    "probability": w.get("score", 0.0)
+                } for w in seg.get("words", []) if "word" in w
+            ]
+        })
+        
+    response_data = {
+        "text": " ".join(seg.get("text", "").strip() for seg in output_segments).strip(),
+        "duration": duration_seconds,
+        "language": detected_lang,
+        "segments": output_segments
+    }
+    return response_data
+
+from pydantic import BaseModel
+
+class LocalTranscribeRequest(BaseModel):
+    file_path: str
+    language: Optional[str] = None
+    response_format: str = "json"
+    diarize: str = "false"
+
+@app.post("/v1/audio/transcriptions/local")
+async def transcribe_local(req: LocalTranscribeRequest):
+    logger.info(f"Received local transcription request for file_path: {req.file_path}, diarize: {req.diarize}")
+    if not os.path.exists(req.file_path):
+         raise HTTPException(status_code=400, detail=f"File not found on shared storage: {req.file_path}")
+    try:
+         result = process_transcription_from_file(
+             req.file_path,
+             req.language,
+             req.response_format,
+             req.diarize
+         )
+         return JSONResponse(content=result)
+    except Exception as e:
+         logger.error(f"Error during local transcription: {e}", exc_info=True)
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
@@ -123,12 +232,7 @@ async def transcribe(
     response_format: str = Form("json"),
     diarize: str = Form("false")
 ):
-    import whisperx
-    
     logger.info(f"Processing transcription request for file: {file.filename}, diarize: {diarize}")
-    
-    # Check if we should enable diarization
-    should_diarize = diarize.lower() == "true"
     
     # 1. Save upload file bytes to a temporary WAV file
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
@@ -138,78 +242,13 @@ async def transcribe(
         tmp_path = tmp_file.name
         
     try:
-        # Load models
-        load_models_if_needed()
-        
-        # 2. Load audio and transcribe
-        logger.info("Loading audio file into WhisperX...")
-        audio = whisperx.load_audio(tmp_path)
-        duration_seconds = len(audio) / 16000.0  # WhisperX audio is loaded at 16000Hz
-        
-        logger.info(f"Running WhisperX transcription (duration: {duration_seconds:.2f}s)...")
-        # Run WhisperX transcription
-        transcribe_args = {}
-        if language and language != "None":
-            transcribe_args["language"] = language
-            
-        result = whisper_model.transcribe(audio, batch_size=16, **transcribe_args)
-        detected_lang = result.get("language", "ru")
-        
-        # 3. Align transcription segments
-        logger.info("Running word-level alignment...")
-        aligned_result = whisperx.align(
-            result["segments"],
-            align_model,
-            align_metadata,
-            audio,
-            device=DEVICE,
-            return_char_alignments=False
+        result = process_transcription_from_file(
+            tmp_path,
+            language,
+            response_format,
+            diarize
         )
-        
-        # 4. Optional Diarization
-        if should_diarize:
-            load_diarize_pipeline_if_needed()
-            logger.info("Running Pyannote speaker diarization...")
-            diarize_segments = diarize_pipeline(audio)
-            
-            logger.info("Assigning speakers to segments and words...")
-            # Assign speaker labels to alignment segments
-            aligned_result = whisperx.assign_word_speakers(diarize_segments, aligned_result)
-            
-        # 5. Format to consistent return structure
-        output_segments = []
-        for idx, seg in enumerate(aligned_result.get("segments", [])):
-            # Fallback values
-            start_time = float(seg.get("start", 0.0))
-            end_time = float(seg.get("end", start_time))
-            text = seg.get("text", "").strip()
-            speaker = seg.get("speaker", None)
-            
-            output_segments.append({
-                "id": idx,
-                "start": start_time,
-                "end": end_time,
-                "text": text,
-                "speaker": speaker,
-                "avg_logprob": seg.get("avg_logprob", 0.0),
-                "words": [
-                    {
-                        "word": w.get("word", ""),
-                        "start": w.get("start", 0.0),
-                        "end": w.get("end", 0.0),
-                        "probability": w.get("score", 0.0)
-                    } for w in seg.get("words", []) if "word" in w
-                ]
-            })
-            
-        response_data = {
-            "text": " ".join(seg.get("text", "").strip() for seg in output_segments).strip(),
-            "duration": duration_seconds,
-            "language": detected_lang,
-            "segments": output_segments
-        }
-        
-        return JSONResponse(content=response_data)
+        return JSONResponse(content=result)
         
     except Exception as e:
         logger.error(f"Error during transcription: {e}", exc_info=True)

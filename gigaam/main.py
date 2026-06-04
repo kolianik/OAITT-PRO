@@ -79,7 +79,7 @@ def load_diarize_pipeline_if_needed():
         logger.info("Loading Pyannote Diarization Pipeline (pyannote/speaker-diarization-community-1)...")
         diarize_pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-community-1",
-            use_auth_token=HF_TOKEN
+            token=HF_TOKEN
         )
         diarize_pipeline.to(DEVICE)
         logger.info("Diarization pipeline loaded successfully")
@@ -132,7 +132,200 @@ def transcribe_audio_tensor(audio_numpy: np.ndarray) -> str:
         if encoded_len is not None:
             del encoded_len
             
-    return result
+    return result[0]
+
+def process_transcription_from_file(
+    file_path: str,
+    language: Optional[str],
+    response_format: str,
+    diarize: str
+) -> dict:
+    should_diarize = diarize.lower() == "true"
+    
+    # 1. Load GigaAM model
+    load_gigaam_model_if_needed()
+    
+    # 2. Read audio
+    logger.info("Reading audio file...")
+    import torchaudio
+    try:
+        waveform, sample_rate = torchaudio.load(file_path)
+        # Convert to mono by averaging channels
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        # Resample to 16000Hz if necessary
+        if sample_rate != 16000:
+            import torchaudio.functional as F
+            waveform = F.resample(waveform, orig_freq=sample_rate, new_freq=16000)
+        audio = waveform.squeeze(0).numpy()
+    except Exception as e:
+        logger.warning(f"Torchaudio failed to read file: {e}. Falling back to soundfile...")
+        audio, sample_rate = sf.read(file_path)
+        # Convert to mono if stereo
+        if len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
+        # Resample to 16000Hz if necessary
+        if sample_rate != 16000:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
+        
+    duration_seconds = len(audio) / 16000.0
+    logger.info(f"Audio loaded successfully. Duration: {duration_seconds:.2f}s")
+    
+    segments = []
+    
+    # 3. Handle diarization path (also used for longform splitting)
+    if should_diarize:
+        load_diarize_pipeline_if_needed()
+        logger.info("Running Pyannote speaker diarization...")
+        
+        # Convert to precise uncompressed WAV if not already WAV to prevent Pyannote sample mismatch on lossy formats (m4a, webm, mp3)
+        temp_wav_path = None
+        pyannote_file = file_path
+        if not file_path.lower().endswith(".wav"):
+            temp_wav_path = file_path + ".pyannote.wav"
+            logger.info(f"Converting file {file_path} to uncompressed WAV for Pyannote precision...")
+            import subprocess
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", file_path,
+                    "-ar", "16000", "-ac", "1", temp_wav_path
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                pyannote_file = temp_wav_path
+            except Exception as e:
+                logger.warning(f"Failed to convert file to WAV with ffmpeg: {e}. Falling back to raw file path.")
+                
+        try:
+            pyannote_result = diarize_pipeline(pyannote_file)
+        finally:
+            # Guarantee clean up of temp wav file
+            if temp_wav_path and os.path.exists(temp_wav_path):
+                try:
+                    os.remove(temp_wav_path)
+                except Exception:
+                    pass
+        
+        # Extract speaker segments
+        raw_intervals = []
+        annotation = pyannote_result.speaker_diarization if hasattr(pyannote_result, "speaker_diarization") else pyannote_result
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
+            raw_intervals.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": speaker
+            })
+            
+        logger.info(f"Diarization finished. Found {len(raw_intervals)} speaker turns.")
+        
+        # Split intervals that exceed GigaAM's 25-second limit
+        intervals = []
+        for interval in raw_intervals:
+            start = interval["start"]
+            end = interval["end"]
+            spk = interval["speaker"]
+            
+            while end - start > 20.0:
+                intervals.append({"start": start, "end": start + 20.0, "speaker": spk})
+                start += 20.0
+            if end - start > 0.1: # Skip negligible segments
+                intervals.append({"start": start, "end": end, "speaker": spk})
+                
+        if not intervals:
+            # Fallback: if no speech detected, transcribe whole file as one segment (up to 20s chunks)
+            logger.warning("No speech segments detected by Pyannote. Falling back to simple chunking.")
+            start = 0.0
+            while start < duration_seconds:
+                end = min(start + 20.0, duration_seconds)
+                intervals.append({"start": start, "end": end, "speaker": "UNKNOWN"})
+                start += 20.0
+                
+        # Transcribe each segment
+        for idx, interval in enumerate(intervals):
+            start_sec = interval["start"]
+            end_sec = interval["end"]
+            spk = interval["speaker"]
+            
+            start_sample = int(start_sec * 16000)
+            end_sample = int(end_sec * 16000)
+            chunk_audio = audio[start_sample:end_sample]
+            
+            if len(chunk_audio) < 160: # Skip extremely short segments (<10ms)
+                continue
+                
+            logger.info(f"Transcribing segment {idx+1}/{len(intervals)}: {start_sec:.2f}s - {end_sec:.2f}s (Speaker: {spk})...")
+            chunk_text = transcribe_audio_tensor(chunk_audio).strip()
+            
+            if chunk_text:
+                segments.append({
+                    "id": idx,
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": chunk_text,
+                    "speaker": spk,
+                    "avg_logprob": 0.0 # GigaAM doesn't easily expose token logprobs
+                })
+                
+    else:
+        # 4. Standard Non-Diarized path (Fixed 20-second chunking for long audio)
+        logger.info("Diarization disabled. Performing fixed 20-second chunking...")
+        start_sec = 0.0
+        idx = 0
+        while start_sec < duration_seconds:
+            end_sec = min(start_sec + 20.0, duration_seconds)
+            start_sample = int(start_sec * 16000)
+            end_sample = int(end_sec * 16000)
+            chunk_audio = audio[start_sample:end_sample]
+            
+            if len(chunk_audio) < 160:
+                break
+                
+            logger.info(f"Transcribing chunk {idx+1}: {start_sec:.2f}s - {end_sec:.2f}s...")
+            chunk_text = transcribe_audio_tensor(chunk_audio).strip()
+            
+            if chunk_text:
+                segments.append({
+                    "id": idx,
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": chunk_text,
+                    "speaker": None,
+                    "avg_logprob": 0.0
+                })
+            idx += 1
+            start_sec += 20.0
+            
+    response_data = {
+        "text": " ".join(seg.get("text", "").strip() for seg in segments).strip(),
+        "duration": duration_seconds,
+        "language": "ru", # GigaAM is Russian-only
+        "segments": segments
+    }
+    return response_data
+
+from pydantic import BaseModel
+
+class LocalTranscribeRequest(BaseModel):
+    file_path: str
+    language: Optional[str] = None
+    response_format: str = "json"
+    diarize: str = "false"
+
+@app.post("/v1/audio/transcriptions/local")
+async def transcribe_local(req: LocalTranscribeRequest):
+    logger.info(f"Received local transcription request for file_path: {req.file_path}, diarize: {req.diarize}")
+    if not os.path.exists(req.file_path):
+         raise HTTPException(status_code=400, detail=f"File not found on shared storage: {req.file_path}")
+    try:
+         result = process_transcription_from_file(
+             req.file_path,
+             req.language,
+             req.response_format,
+             req.diarize
+         )
+         return JSONResponse(content=result)
+    except Exception as e:
+         logger.error(f"Error during local transcription: {e}", exc_info=True)
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
@@ -143,8 +336,6 @@ async def transcribe(
 ):
     logger.info(f"Processing transcription request for file: {file.filename}, diarize: {diarize}")
     
-    should_diarize = diarize.lower() == "true"
-    
     # Save upload file bytes to a temporary WAV file
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
@@ -153,129 +344,13 @@ async def transcribe(
         tmp_path = tmp_file.name
         
     try:
-        # 1. Load GigaAM model
-        load_gigaam_model_if_needed()
-        
-        # 2. Read audio
-        logger.info("Reading audio file...")
-        audio, sample_rate = sf.read(tmp_path)
-        
-        # Convert to mono if stereo
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1)
-            
-        # Resample to 16000Hz if necessary
-        if sample_rate != 16000:
-            import librosa
-            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
-            
-        duration_seconds = len(audio) / 16000.0
-        logger.info(f"Audio loaded successfully. Duration: {duration_seconds:.2f}s")
-        
-        segments = []
-        
-        # 3. Handle diarization path (also used for longform splitting)
-        if should_diarize:
-            load_diarize_pipeline_if_needed()
-            logger.info("Running Pyannote speaker diarization...")
-            pyannote_result = diarize_pipeline(tmp_path)
-            
-            # Extract speaker segments
-            raw_intervals = []
-            for turn, _, speaker in pyannote_result.itertracks(yield_label=True):
-                raw_intervals.append({
-                    "start": turn.start,
-                    "end": turn.end,
-                    "speaker": speaker
-                })
-                
-            logger.info(f"Diarization finished. Found {len(raw_intervals)} speaker turns.")
-            
-            # Split intervals that exceed GigaAM's 25-second limit
-            intervals = []
-            for interval in raw_intervals:
-                start = interval["start"]
-                end = interval["end"]
-                spk = interval["speaker"]
-                
-                while end - start > 20.0:
-                    intervals.append({"start": start, "end": start + 20.0, "speaker": spk})
-                    start += 20.0
-                if end - start > 0.1: # Skip negligible segments
-                    intervals.append({"start": start, "end": end, "speaker": spk})
-                    
-            if not intervals:
-                # Fallback: if no speech detected, transcribe whole file as one segment (up to 20s chunks)
-                logger.warning("No speech segments detected by Pyannote. Falling back to simple chunking.")
-                start = 0.0
-                while start < duration_seconds:
-                    end = min(start + 20.0, duration_seconds)
-                    intervals.append({"start": start, "end": end, "speaker": "UNKNOWN"})
-                    start += 20.0
-                    
-            # Transcribe each segment
-            for idx, interval in enumerate(intervals):
-                start_sec = interval["start"]
-                end_sec = interval["end"]
-                spk = interval["speaker"]
-                
-                start_sample = int(start_sec * 16000)
-                end_sample = int(end_sec * 16000)
-                chunk_audio = audio[start_sample:end_sample]
-                
-                if len(chunk_audio) < 160: # Skip extremely short segments (<10ms)
-                    continue
-                    
-                logger.info(f"Transcribing segment {idx+1}/{len(intervals)}: {start_sec:.2f}s - {end_sec:.2f}s (Speaker: {spk})...")
-                chunk_text = transcribe_audio_tensor(chunk_audio).strip()
-                
-                if chunk_text:
-                    segments.append({
-                        "id": idx,
-                        "start": start_sec,
-                        "end": end_sec,
-                        "text": chunk_text,
-                        "speaker": spk,
-                        "avg_logprob": 0.0 # GigaAM doesn't easily expose token logprobs
-                    })
-                    
-        else:
-            # 4. Standard Non-Diarized path (Fixed 20-second chunking for long audio)
-            logger.info("Diarization disabled. Performing fixed 20-second chunking...")
-            start_sec = 0.0
-            idx = 0
-            while start_sec < duration_seconds:
-                end_sec = min(start_sec + 20.0, duration_seconds)
-                start_sample = int(start_sec * 16000)
-                end_sample = int(end_sec * 16000)
-                chunk_audio = audio[start_sample:end_sample]
-                
-                if len(chunk_audio) < 160:
-                    break
-                    
-                logger.info(f"Transcribing chunk {idx+1}: {start_sec:.2f}s - {end_sec:.2f}s...")
-                chunk_text = transcribe_audio_tensor(chunk_audio).strip()
-                
-                if chunk_text:
-                    segments.append({
-                        "id": idx,
-                        "start": start_sec,
-                        "end": end_sec,
-                        "text": chunk_text,
-                        "speaker": None,
-                        "avg_logprob": 0.0
-                    })
-                idx += 1
-                start_sec += 20.0
-                
-        response_data = {
-            "text": " ".join(seg.get("text", "").strip() for seg in segments).strip(),
-            "duration": duration_seconds,
-            "language": "ru", # GigaAM is Russian-only
-            "segments": segments
-        }
-        
-        return JSONResponse(content=response_data)
+        result = process_transcription_from_file(
+            tmp_path,
+            language,
+            response_format,
+            diarize
+        )
+        return JSONResponse(content=result)
         
     except Exception as e:
         logger.error(f"Error during transcription: {e}", exc_info=True)

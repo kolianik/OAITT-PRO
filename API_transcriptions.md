@@ -1,20 +1,21 @@
-# API Reference: POST /v1/audio/transcriptions
+# API Reference: Asynchronous Transcription API
 
-The primary transcription endpoint. It is fully compatible with OpenAI's Audio Transcriptions API but extended with advanced features like Pyannote v4 speaker diarization, anti-hallucination thresholds, and dynamic GigaAM VRAM selection.
+Due to Cloudflare's 100MB body size limit and 100-second request timeout limit on proxied connections, the OAITT-PRO transcription system employs an entirely asynchronous architecture. 
+
+*   **Submitting Jobs:** Use the unproxied upload endpoint (typically host port `3000` or `PROXY_PORT_HTTP`) to upload large audio files (>200MB): `https://direct.<your-domain>:3000/v1/audio/transcriptions/async`.
+*   **Checking Status / Getting Results:** Use your public API hostname: `https://<your-domain>/v1/audio/transcriptions/status/{job_id}`.
 
 ---
 
-## 📡 Protocol Specification
+## 1. 📡 Submit Transcription Job
 
-*   **URL:** `/v1/audio/transcriptions`
+*   **URL:** `https://direct.<your-domain>:3000/v1/audio/transcriptions/async` (Bypasses Cloudflare body limits when using a DNS-only upload hostname)
 *   **Method:** `POST`
 *   **Content-Type:** `multipart/form-data`
 *   **Headers:**
     *   `Authorization`: `Bearer <API_TOKEN>` (**Required**)
 
----
-
-## 📋 Multipart Form-Data Parameters
+### 📋 Multipart Form-Data Parameters
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -25,62 +26,105 @@ The primary transcription endpoint. It is fully compatible with OpenAI's Audio T
 | **diarize** | `boolean` | No | `false` | Enable **Pyannote.audio v4.0.4** speaker diarization (works with both engines). |
 | **min_avg_logprob** | `float` | No | — | Anti-hallucination threshold. Discards segments with logprob lower than this value. |
 | **max_chars_per_second** | `float` | No | — | Anti-hallucination speech rate limit. Discards segments with characters/sec higher than this value. |
+| **webhook_url** | `string` | No | — | Optional HTTP webhook URL to receive the transcription result payload as a POST request once complete. |
+
+### 💻 Request & Response Example
+
+#### Request:
+```bash
+curl -X POST "https://direct.<your-domain>:3000/v1/audio/transcriptions/async" \
+     -H "Authorization: Bearer <your_api_key>" \
+     -F "file=@/path/to/large_audio.mp3" \
+     -F "model=whisper-1" \
+     -F "diarize=true" \
+     -F "webhook_url=https://my-client-app.com/webhooks/transcribe"
+```
+
+#### Response (`202 Accepted`):
+```json
+{
+  "job_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "pending",
+  "created_at": "2026-06-01T12:00:00.000000Z"
+}
+```
 
 ---
 
-## 💻 Request & Response Examples
+## 2. 📡 Get Job Status & Results
 
-### 1. Simple WhisperX Transcription (JSON)
-```bash
-curl -X POST "https://api.yourdomain.com/v1/audio/transcriptions" \
-     -H "Authorization: Bearer default-client-key" \
-     -F "file=@/path/to/audio.mp3" \
-     -F "model=whisper-1"
-```
-#### Response (`200 OK`):
+*   **URL:** `https://<your-domain>/v1/audio/transcriptions/status/{job_id}` (May be served via CDN on port 443)
+*   **Method:** `GET`
+*   **Headers:**
+    *   `Authorization`: `Bearer <API_TOKEN>` (**Required**)
+
+### 📋 Query Parameters
+
+| Parameter | Type | Required | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **output** | `string` | No | `json` | Formats the returned transcription. Options: `json`, `text`, `srt`, `vtt`, `tsv`. |
+
+### 💻 Response Examples
+
+#### Case A: Job is still processing (`200 OK`):
 ```json
 {
-  "text": "Здравствуйте, это тестовая запись."
+  "job_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "processing",
+  "created_at": "2026-06-01T12:00:00.000000+00:00",
+  "updated_at": "2026-06-01T12:00:15.123456+00:00"
 }
 ```
 
-### 2. GigaAM Transcription with Diarization and Filters (Verbose JSON)
-```bash
-curl -X POST "https://api.yourdomain.com/v1/audio/transcriptions" \
-     -H "Authorization: Bearer default-client-key" \
-     -F "file=@/path/to/long_audio.wav" \
-     -F "model=gigaam" \
-     -F "response_format=verbose_json" \
-     -F "diarize=true" \
-     -F "min_avg_logprob=-0.5" \
-     -F "max_chars_per_second=25.0"
-```
-#### Response (`200 OK`):
+#### Case B: Job finished successfully (with `output=json`, `200 OK`):
 ```json
 {
-  "text": "Привет! Как твои дела? Всё отлично, спасибо!",
-  "language": "ru",
-  "duration": 12.5,
-  "segments": [
-    {
-      "id": 0,
-      "start": 0.0,
-      "end": 4.2,
-      "text": "Привет! Как твои дела?",
-      "speaker": "SPEAKER_00",
-      "avg_logprob": 0.0,
-      "chars_per_second": 5.23
-    },
-    {
-      "id": 1,
-      "start": 4.5,
-      "end": 12.5,
-      "text": "Всё отлично, спасибо!",
-      "speaker": "SPEAKER_01",
-      "avg_logprob": 0.0,
-      "chars_per_second": 2.62
-    }
-  ]
+  "job_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "completed",
+  "created_at": "2026-06-01T12:00:00.000000+00:00",
+  "updated_at": "2026-06-01T12:05:30.456789+00:00",
+  "result": {
+    "text": "Привет! Как твои дела? Всё отлично, спасибо!",
+    "language": "ru",
+    "duration": 12.5,
+    "segments": [
+      {
+        "id": 0,
+        "start": 0.0,
+        "end": 4.2,
+        "text": "Привет! Как твои дела?",
+        "speaker": "SPEAKER_00",
+        "avg_logprob": -0.12
+      },
+      {
+        "id": 1,
+        "start": 4.5,
+        "end": 12.5,
+        "text": "Всё отлично, спасибо!",
+        "speaker": "SPEAKER_01",
+        "avg_logprob": -0.05
+      }
+    ]
+  }
 }
 ```
-*Note: GigaAM RNNT uses custom Pyannote v4 voice chunking and speaker overlapping mapped into the response segments.*
+
+#### Case C: Job failed (`200 OK`):
+```json
+{
+  "job_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "status": "failed",
+  "created_at": "2026-06-01T12:00:00.000000+00:00",
+  "updated_at": "2026-06-01T12:01:45.987654+00:00",
+  "error_message": "Inference engine returned status 500: CUDA Out of Memory"
+}
+```
+
+---
+
+## 3. 🛡️ Data Retention Policy
+
+To manage free disk space on the RTX 3060 server efficiently and protect privacy:
+1.  **Strict Immediate Deletion:** The source audio file uploaded by the client is stored in the shared workspace `/shared_data` and is **guaranteed to be deleted** immediately when the transcription job completes (whether successfully or in failure).
+2.  **24-Hour Job Expiration:** Complete transcription records (status and text result) are kept in the PostgreSQL database for a maximum of **24 hours** after creation.
+3.  **Automatic Garbage Collector:** A background garbage collector runs every hour to delete database records and any uncompleted/orphaned files older than 24 hours.

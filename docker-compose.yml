@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres:17-alpine
     container_name: oaitt-postgres
     restart: always
     environment:
@@ -34,6 +34,8 @@ services:
       - ADMIN_KEY=${ADMIN_KEY:-admin-secret-key}
       - WHISPERX_URL=http://whisperx-service:9007
       - GIGAAM_URL=http://gigaam-service:9007
+    volumes:
+      - oaitt_shared_data:/shared_data
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,7 +52,8 @@ services:
       - WHISPERX_MODEL=${WHISPERX_MODEL:-bzikst/faster-whisper-large-v3-russian}
       - HF_TOKEN=${HF_TOKEN}
     volumes:
-      - model_cache:/app/data
+      - whisperx_model_cache:/app/data
+      - oaitt_shared_data:/shared_data
     deploy:
       resources:
         reservations:
@@ -70,7 +73,8 @@ services:
       - GIGAAM_MODEL=${GIGAAM_MODEL:-v3_e2e_rnnt}
       - HF_TOKEN=${HF_TOKEN}
     volumes:
-      - model_cache:/app/data
+      - gigaam_model_cache:/app/data
+      - oaitt_shared_data:/shared_data
     deploy:
       resources:
         reservations:
@@ -90,6 +94,7 @@ services:
       - "${PROXY_PORT_HTTP:-80}:80"
     volumes:
       - certs:/etc/letsencrypt
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - gateway-orchestrator
 
@@ -113,7 +118,7 @@ services:
       echo 'dns_cloudflare_api_token = '$${CLOUDFLARE_API_TOKEN} > /root/.secrets/cloudflare.ini &&
       chmod 600 /root/.secrets/cloudflare.ini &&
       if [ ! -f /etc/letsencrypt/active ]; then
-        echo 'Acquiring real SSL wildcard certificate from Let\'s Encrypt...';
+        echo \"Acquiring real SSL wildcard certificate from Let's Encrypt...\" &&
         certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini --agree-tos --email $${EMAIL} -d $${DOMAIN_NAME} -d *.$${DOMAIN_NAME} --non-interactive --cert-name transcribe &&
         touch /etc/letsencrypt/active;
       fi;
@@ -125,4 +130,6 @@ services:
 volumes:
   pgdata:
   certs:
-  model_cache:
+  whisperx_model_cache:
+  gigaam_model_cache:
+  oaitt_shared_data:

@@ -23,11 +23,12 @@ RUN mkdir -p /app/data
 
 # Copy pre-downloader and run it to bake models
 COPY download_models.py .
-RUN python download_models.py
+# RUN python download_models.py
 
 # Copy application files
 COPY main.py .
 
 EXPOSE 9007
 
+ENTRYPOINT []
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9007"]

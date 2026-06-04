@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --default-timeout=1000 \
 
 # Install requirements
 COPY gigaam/requirements.txt .
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --default-timeout=1000 --retries 10 \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
     -r requirements.txt

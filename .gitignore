@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -11,9 +12,15 @@ htmlcov/
 
 # Local configuration & Secrets
 .env
+.env.*
+!.env.example
+.env.local
+secrets/
+credentials.json
 *.pem
 *.key
 cloudflare.ini
+docker-compose.override.yml
 
 # Large directories / Application data
 data/
@@ -21,12 +28,64 @@ certs/
 pgdata/
 model_cache/
 
-# OS-generated files
-Thumbs.db
-Desktop.ini
-.DS_Store
+# Logs
+*.log
 
-# Editor configurations
+# Test & QA artifacts (transcripts, API keys, server logs)
+test_results/
+tets_data/
+test_data/
+
+# Private operations (SSH deploy, remote diagnostics, internal runbooks)
+DEPLOYMENT_INFO.md
+TESTING_SPECIFICATION.md
+MANUAL_TESTING_GUIDE.md
+PLAN_PRICING.md
+tools/private/
+apply_changes.py
+build_and_restart.py
+cat_env.py
+check_*.py
+compare_diarization_results.py
+copy_and_restart.py
+debug_docker_rm.py
+deploy_*.py
+export_compare_text.py
+free_space.py
+full_restart_and_nohup.py
+get_build_state.py
+hotfix_*.py
+inspect_containers.py
+kill_docker_run.py
+print_raw_logs.py
+read_*.py
+reboot_server.py
+reset_gpu.py
+restart_docker_and_start.py
+run_*.py
+scan_files.py
+test_diagnostics.py
+test_local_health.py
+test_remote.py
+test_runner.py
+test_save_reports.py
+toggle_chia.py
+update_*.py
+upload_*.py
+verify_*.py
+wait_for_startup.py
+
+# Media samples (may contain PII)
+*.wav
+*.m4a
+*.webm
+
+# Python environments
+.venv/
+venv/
+
+# Cursor / IDE
+.cursor/
 .vscode/
 .idea/
 *.suo
@@ -34,3 +93,8 @@ Desktop.ini
 *.njsproj
 *.sln
 *.swp
+
+# OS-generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
