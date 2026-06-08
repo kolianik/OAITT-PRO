@@ -2,8 +2,9 @@ import os
 import sys
 import ssl
 
-# Disable SSL verification for model downloads to bypass local machine cert issues
-ssl._create_default_https_context = ssl._create_unverified_context
+if os.getenv("PREPARE_INSECURE_SSL", "").strip() in {"1", "true", "yes"}:
+    print("WARNING: SSL certificate verification is disabled (PREPARE_INSECURE_SSL). Use only in development.")
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 def download_gigaam_weights():
     print("OAITT-PRO Model Weights Downloader")

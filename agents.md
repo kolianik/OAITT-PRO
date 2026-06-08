@@ -6,12 +6,14 @@ This file defines the system architecture, component roles, interface contracts,
 
 ## 1. System Topology
 
-OAITT-PRO is structured as a multi-agent system of 5 containerized services running on a single RTX 3060 (12GB VRAM) host. 
-To bypass Cloudflare body size (100MB) limits, uploads are directed to port `3000` on the firewall (unproxied host IP), while status queries, analytics, and health-checks go through the proxied port `443`:
+OAITT-PRO is structured as a multi-agent system of 5 containerized services running on a single NVIDIA GPU host (validated on RTX 3060 12 GB VRAM; RTX 3080 10 GB with `WHISPERX_BATCH_SIZE` tuning).  
+To bypass Cloudflare body size (100MB) limits, uploads use **`API_UPLOAD_HOST`** and host port **`PROXY_PORT_HTTP`** from `.env` (DNS-only / unproxied). Status, analytics, and health use **`API_PUBLIC_HOST`** (typically via Cloudflare on port 443).
+
+**Network segmentation** (Docker Compose): `edge_net` (internet → nginx only), `backend_net` internal (nginx ↔ gateway ↔ postgres), `inference_net` internal (gateway ↔ whisperx/gigaam). Cleartext HTTP is used only on internal networks; TLS terminates at nginx.
 
 ```
-[Client] ──(Upload to :3000)──► [Front Nginx Proxy] (Port 80)
-[Client] ──(Query to :443)───► [Cloudflare Proxy] ──► [Front Nginx Proxy] (Port 80)
+[Client] ──(Upload: API_UPLOAD_HOST:PROXY_PORT_HTTP)──► [Front Nginx Proxy]
+[Client] ──(Query: API_PUBLIC_HOST / :443)──► [Cloudflare] ──► [Front Nginx Proxy]
                                       │
                                       ▼
                            [API Orchestrator Gateway] <───► [PostgreSQL 17]
@@ -21,7 +23,7 @@ To bypass Cloudflare body size (100MB) limits, uploads are directed to port `300
                     │                                   │
                     ▼                                   ▼
             [WhisperX Service]                  [GigaAM Service]
-           (large-v3-russian)                    (v3_e2e_rnnt)
+           (large-v3-russian, FP16)              (v3_e2e_rnnt)
 ```
 
 ---
@@ -29,13 +31,13 @@ To bypass Cloudflare body size (100MB) limits, uploads are directed to port `300
 ## 2. Agent Definitions & Contracts
 
 ### 2.1. Front Nginx Proxy (Security & TLS Agent)
-*   **Role:** Exposes port 80 internally (forwarded from port 3000 at the firewall, or port 443 via Cloudflare CDN).
+*   **Role:** Exposes host ports `PROXY_PORT_HTTP` and `PROXY_PORT_HTTPS` (mapped to container 80/443).
 *   **SSL Management:** Certbot sidecar running the Cloudflare DNS-01 challenge.
 *   **Config Contract:**
-    *   Expose: `80/tcp`, `443/tcp` (NAT `3000` to internal `80`)
-    *   Target: `http://gateway-orchestrator:9000`
+    *   Host ports: `${PROXY_PORT_HTTP}:80`, `${PROXY_PORT_HTTPS}:443` (from `.env`)
+    *   Target: `http://gateway-orchestrator:9000` (backend_net only)
     *   SSL Cert Storage: Shared Docker volume `/etc/letsencrypt`
-    *   `client_max_body_size`: `2048M` (Supports large media files uploaded over unproxied port 3000)
+    *   `client_max_body_size`: `2048M` (large uploads via `API_UPLOAD_HOST` / `PROXY_PORT_HTTP`)
 
 ---
 

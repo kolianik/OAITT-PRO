@@ -1,6 +1,8 @@
 # OAITT-PRO Installation & Troubleshooting Guide
 
-This document provides detailed setup instructions, common errors, and professional troubleshooting procedures for running the OAITT-PRO high-performance transcription and diarization system on NVIDIA GPUs (e.g., RTX 3060, RTX 3080).
+This document provides detailed setup instructions, common errors, and professional troubleshooting procedures for running the OAITT-PRO high-performance transcription and diarization system on NVIDIA GPUs (e.g., RTX 3060 12 GB, RTX 3080 10 GB).
+
+For a step-by-step Ubuntu 24.04 LTS install, see **[INSTALL.md](INSTALL.md)**. Client-facing hostnames and ports are defined only in [`.env.example`](.env.example).
 
 ---
 
@@ -59,6 +61,7 @@ This occurs when Python/pip inside the container fails to verify Let's Encrypt o
         ```bash
         pip install <package_name> --trusted-host pypi.org --trusted-host files.pythonhosted.org
         ```
+    *   For host-side `prepare.py` / GigaAM weight downloads behind a corporate TLS proxy, SSL verification is **enabled by default**. Only for local development set `PREPARE_INSECURE_SSL=1` before running `python prepare.py` (never in production).
 
 ---
 
@@ -82,13 +85,15 @@ When building `gigaam-service`, pip downloads over 1.5 GB of CUDA PyTorch binari
 ---
 
 ### ❌ Error 5: "CUDA Out-Of-Memory (OOM)" on RTX 3060/3080
-Running multiple heavy deep learning models (Whisper Large V3, GigaAM RNNT, and Pyannote Diarization) at the same time can exceed the GPU's memory limit.
+Running multiple heavy deep learning models (Whisper Large V3 FP16, GigaAM RNNT, and Pyannote Diarization) at the same time can exceed the GPU's memory limit. Regression tests were run on **RTX 3060 (12 GB)**; **RTX 3080 (10 GB)** has less headroom, especially with `diarize=true` on long files.
 
-*   **Cause:** Both services attempting to hold active models in GPU VRAM.
-*   **Solution:**
-    *   This is **fully governed** by our `API Orchestrator` (Gateway). The Gateway implements a strict **async Lock** and a VRAM exclusivity protocol. 
-    *   Before sending a request to GigaAM, the Orchestrator commands the WhisperX container to unload: `POST /unload`. This executes Python Garbage Collection and `torch.cuda.empty_cache()` to free 100% of its VRAM.
-    *   Always proxy your calls through the **Gateway (Port 9000)** instead of hitting the backend model containers (Port 9007) directly.
+*   **Cause:** Both services attempting to hold active models in GPU VRAM, or WhisperX batch size too large for available VRAM.
+*   **Solution (required):**
+    *   Use the **Gateway** only. It implements a strict **async lock** and VRAM exclusivity: before switching engines it calls `POST /unload` on the other service (`torch.cuda.empty_cache()`). Do **not** call inference containers on port 9007 directly.
+    *   Lower **`WHISPERX_BATCH_SIZE`** in `.env` (e.g. `4` → `2` → `1`), then restart: `docker compose up -d`. This reduces peak VRAM during transcription **without changing model weights or precision**.
+*   **Not allowed (quality policy):**
+    *   Do **not** set `WHISPERX_COMPUTE_TYPE` to `int8`, `int8_float16`, or any value other than **`float16`** on CUDA. The WhisperX service rejects unsupported compute types at startup.
+    *   Do **not** switch to a smaller ASR model without an explicit product decision — that changes accuracy, not just memory tuning.
 
 ---
 
@@ -116,9 +121,13 @@ GigaAM's core `.transcribe()` tensor engine is strictly mathematically limited t
 Отредактируйте файл `.env` на сервере. Укажите нужный вам открытый порт (например, `8443`), который вы будете пробрасывать на роутере:
 
 ```env
+API_PUBLIC_HOST=transcribe.yourdomain.com
+API_UPLOAD_HOST=direct.yourdomain.com
 PROXY_PORT_HTTPS=8443
-PROXY_PORT_HTTP=8080 # (вспомогательный порт, его пробрасывать наружу не требуется)
+PROXY_PORT_HTTP=8080
 ```
+
+If large uploads use a dedicated public port (e.g. 3000), set `PROXY_PORT_HTTP=3000` on the host instead of relying on a separate NAT mapping.
 
 Запустите контейнеры:
 ```bash

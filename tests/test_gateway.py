@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import socket
 from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
 from datetime import datetime, timezone
@@ -51,11 +52,14 @@ async def test_async_job_creation(mock_create_job, mock_auth, client):
     mock_create_job.return_value = "mocked-job-uuid-1234"
     
     # Mock os.makedirs and open to prevent actual disk writing during test
-    with patch("os.makedirs"), patch("builtins.open", MagicMock()):
+    with patch("os.makedirs"), patch("builtins.open", MagicMock()), patch(
+        "shared.security.socket.getaddrinfo",
+        return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    ):
         response = client.post(
             "/v1/audio/transcriptions/async",
             files={"file": ("test.wav", b"fake audio content")},
-            data={"model": "whisperx", "diarize": "true", "webhook_url": "http://callback.io"},
+            data={"model": "whisperx", "diarize": "true", "webhook_url": "https://callback.io"},
             headers={"Authorization": "Bearer valid-token"}
         )
         
@@ -70,8 +74,9 @@ async def test_async_job_creation(mock_create_job, mock_auth, client):
     call_args_dict = mock_create_job.call_args[1]
     assert call_args_dict["client_id"] == "test-client-uuid"
     assert call_args_dict["filename"] == "test.wav"
-    assert call_args_dict["file_path"].startswith("/shared_data/")
-    assert call_args_dict["file_path"].endswith(".wav")
+    normalized_path = call_args_dict["file_path"].replace("\\", "/")
+    assert "shared_data" in normalized_path
+    assert normalized_path.endswith(".wav")
     assert call_args_dict["engine"] == "whisperx"
     assert call_args_dict["model_name"] == "bzikst/faster-whisper-large-v3-russian"
     assert call_args_dict["diarization_enabled"] is True
@@ -79,7 +84,23 @@ async def test_async_job_creation(mock_create_job, mock_auth, client):
     assert call_args_dict["response_format"] == "json"
     assert call_args_dict["min_avg_logprob"] is None
     assert call_args_dict["max_chars_per_second"] is None
-    assert call_args_dict["webhook_url"] == "http://callback.io"
+    assert call_args_dict["webhook_url"] == "https://callback.io"
+
+@pytest.mark.asyncio
+@patch("gateway.main.authenticate_client", new_callable=AsyncMock)
+@patch("gateway.main.create_transcription_job", new_callable=AsyncMock)
+async def test_async_job_rejects_http_webhook(mock_create_job, mock_auth, client):
+    mock_auth.return_value = {"id": "test-client-uuid", "name": "Test Client", "role": "client"}
+    with patch("os.makedirs"), patch("builtins.open", MagicMock()):
+        response = client.post(
+            "/v1/audio/transcriptions/async",
+            files={"file": ("test.wav", b"fake audio content")},
+            data={"webhook_url": "http://callback.io"},
+            headers={"Authorization": "Bearer valid-token"},
+        )
+    assert response.status_code == 400
+    assert mock_create_job.call_count == 0
+
 
 @pytest.mark.asyncio
 @patch("gateway.main.authenticate_client", new_callable=AsyncMock)

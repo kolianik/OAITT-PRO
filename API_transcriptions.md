@@ -2,14 +2,14 @@
 
 Due to Cloudflare's 100MB body size limit and 100-second request timeout limit on proxied connections, the OAITT-PRO transcription system employs an entirely asynchronous architecture. 
 
-*   **Submitting Jobs:** Use the unproxied upload endpoint (typically host port `3000` or `PROXY_PORT_HTTP`) to upload large audio files (>200MB): `https://direct.<your-domain>:3000/v1/audio/transcriptions/async`.
-*   **Checking Status / Getting Results:** Use your public API hostname: `https://<your-domain>/v1/audio/transcriptions/status/{job_id}`.
+*   **Submitting Jobs:** Use the upload hostname and HTTP port from `.env`: `https://${API_UPLOAD_HOST}:${PROXY_PORT_HTTP}/v1/audio/transcriptions/async` (large files >200MB; DNS-only upload host bypasses CDN limits).
+*   **Checking Status / Getting Results:** `https://${API_PUBLIC_HOST}/v1/audio/transcriptions/status/{job_id}`.
 
 ---
 
 ## 1. 📡 Submit Transcription Job
 
-*   **URL:** `https://direct.<your-domain>:3000/v1/audio/transcriptions/async` (Bypasses Cloudflare body limits when using a DNS-only upload hostname)
+*   **URL:** `https://${API_UPLOAD_HOST}:${PROXY_PORT_HTTP}/v1/audio/transcriptions/async` (DNS-only upload host bypasses Cloudflare body limits)
 *   **Method:** `POST`
 *   **Content-Type:** `multipart/form-data`
 *   **Headers:**
@@ -26,13 +26,13 @@ Due to Cloudflare's 100MB body size limit and 100-second request timeout limit o
 | **diarize** | `boolean` | No | `false` | Enable **Pyannote.audio v4.0.4** speaker diarization (works with both engines). |
 | **min_avg_logprob** | `float` | No | — | Anti-hallucination threshold. Discards segments with logprob lower than this value. |
 | **max_chars_per_second** | `float` | No | — | Anti-hallucination speech rate limit. Discards segments with characters/sec higher than this value. |
-| **webhook_url** | `string` | No | — | Optional HTTP webhook URL to receive the transcription result payload as a POST request once complete. |
+| **webhook_url** | `string` | No | — | Optional **HTTPS** webhook URL (public hostname only). The gateway POSTs the result JSON when the job completes. Private IPs, localhost, link-local, and cloud metadata addresses are rejected. Redirects are not followed. |
 
 ### 💻 Request & Response Example
 
 #### Request:
 ```bash
-curl -X POST "https://direct.<your-domain>:3000/v1/audio/transcriptions/async" \
+curl -X POST "https://${API_UPLOAD_HOST}:${PROXY_PORT_HTTP}/v1/audio/transcriptions/async" \
      -H "Authorization: Bearer <your_api_key>" \
      -F "file=@/path/to/large_audio.mp3" \
      -F "model=whisper-1" \
@@ -53,7 +53,7 @@ curl -X POST "https://direct.<your-domain>:3000/v1/audio/transcriptions/async" \
 
 ## 2. 📡 Get Job Status & Results
 
-*   **URL:** `https://<your-domain>/v1/audio/transcriptions/status/{job_id}` (May be served via CDN on port 443)
+*   **URL:** `https://${API_PUBLIC_HOST}/v1/audio/transcriptions/status/{job_id}` (typically via CDN on port 443)
 *   **Method:** `GET`
 *   **Headers:**
     *   `Authorization`: `Bearer <API_TOKEN>` (**Required**)

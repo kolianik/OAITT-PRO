@@ -1,0 +1,6 @@
+# Optional override: expose gateway on the host for local debugging.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d
+services:
+  gateway-orchestrator:
+    ports:
+      - "${GATEWAY_PORT:-9000}:9000"

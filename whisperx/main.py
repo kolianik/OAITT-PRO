@@ -1,12 +1,20 @@
 import os
+import sys
 import gc
 import tempfile
 import logging
 import torch
 import time
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status, Header, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from shared.security import (
+    INTERNAL_TOKEN_HEADER,
+    validate_shared_path,
+    verify_internal_service_token,
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -45,13 +53,32 @@ except Exception as e:
 # Configuration
 WHISPER_MODEL_NAME = os.getenv("WHISPERX_MODEL", "bzikst/faster-whisper-large-v3-russian")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16")
+COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", os.getenv("WHISPERX_COMPUTE_TYPE", "float16"))
+if DEVICE == "cuda" and COMPUTE_TYPE != "float16":
+    raise RuntimeError(
+        f"Unsupported WHISPERX_COMPUTE_TYPE={COMPUTE_TYPE!r} on CUDA. "
+        "Only float16 is allowed (int8 and other quantizations are disabled)."
+    )
 if DEVICE == "cpu" and COMPUTE_TYPE == "float16":
     logger.info("CPU detected. Falling back from float16 to float32 for CTranslate2 compatibility.")
     COMPUTE_TYPE = "float32"
+try:
+    WHISPERX_BATCH_SIZE = max(1, int(os.getenv("WHISPERX_BATCH_SIZE", "4")))
+except ValueError as e:
+    raise RuntimeError("WHISPERX_BATCH_SIZE must be a positive integer") from e
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 app = FastAPI(title="WhisperX Inference Service", version="1.0.0")
+
+
+async def require_internal_service(
+    x_internal_service_token: Optional[str] = Header(None, alias=INTERNAL_TOKEN_HEADER),
+) -> None:
+    try:
+        verify_internal_service_token(x_internal_service_token)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden") from exc
+
 
 # Loaded Models (Lazy)
 whisper_model = None
@@ -97,7 +124,7 @@ def load_diarize_pipeline_if_needed():
         logger.info("Diarization pipeline loaded successfully")
 
 @app.post("/unload")
-async def unload_models():
+async def unload_models(_auth: None = Depends(require_internal_service)):
     global whisper_model, align_model, align_metadata, diarize_pipeline
     
     logger.info("Received request to UNLOAD WhisperX models from memory...")
@@ -141,8 +168,7 @@ def process_transcription_from_file(
     if language and language != "None" and language != "":
         transcribe_args["language"] = language
         
-    # Reduce batch_size to 4 to prevent CUDA Out Of Memory (OOM) on large/long files (>1 hour)
-    result = whisper_model.transcribe(audio, batch_size=4, **transcribe_args)
+    result = whisper_model.transcribe(audio, batch_size=WHISPERX_BATCH_SIZE, **transcribe_args)
     detected_lang = result.get("language", "ru")
     
     # 3. Align transcription segments
@@ -209,21 +235,26 @@ class LocalTranscribeRequest(BaseModel):
     diarize: str = "false"
 
 @app.post("/v1/audio/transcriptions/local")
-async def transcribe_local(req: LocalTranscribeRequest):
-    logger.info(f"Received local transcription request for file_path: {req.file_path}, diarize: {req.diarize}")
-    if not os.path.exists(req.file_path):
-         raise HTTPException(status_code=400, detail=f"File not found on shared storage: {req.file_path}")
+async def transcribe_local(
+    req: LocalTranscribeRequest,
+    _auth: None = Depends(require_internal_service),
+):
+    logger.info("Received local transcription request, diarize: %s", req.diarize)
+    try:
+        safe_path = validate_shared_path(req.file_path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="File not found on shared storage")
     try:
          result = process_transcription_from_file(
-             req.file_path,
+             safe_path,
              req.language,
              req.response_format,
              req.diarize
          )
          return JSONResponse(content=result)
     except Exception as e:
-         logger.error(f"Error during local transcription: {e}", exc_info=True)
-         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+         logger.error("Error during local transcription: %s", e, exc_info=True)
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Transcription failed")
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
@@ -251,8 +282,8 @@ async def transcribe(
         return JSONResponse(content=result)
         
     except Exception as e:
-        logger.error(f"Error during transcription: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        logger.error("Error during transcription: %s", e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Transcription failed")
         
     finally:
         # Clean up temporary audio file

@@ -38,7 +38,7 @@ Create a new tariff row for a client. Closes any previously open tariff (`valid_
 ### Example
 
 ```bash
-curl -X POST "https://api.yourdomain.com/api/v1/admin/pricing" \
+curl -X POST "https://${API_PUBLIC_HOST}/api/v1/admin/pricing" \
   -H "Authorization: Bearer <ADMIN_KEY>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -78,7 +78,7 @@ Returns the currently active tariff for a client.
 | `404` | No active tariff for this client. |
 
 ```bash
-curl -X GET "https://api.yourdomain.com/api/v1/admin/pricing?client_id=00000000-0000-0000-0000-000000000000" \
+curl -X GET "https://${API_PUBLIC_HOST}/api/v1/admin/pricing?client_id=00000000-0000-0000-0000-000000000000" \
   -H "Authorization: Bearer <ADMIN_KEY>"
 ```
 
@@ -95,6 +95,6 @@ Returns all tariff rows for a client, newest `valid_from` first.
 | `200` | JSON array of tariff records. |
 
 ```bash
-curl -X GET "https://api.yourdomain.com/api/v1/admin/pricing/history?client_id=00000000-0000-0000-0000-000000000000" \
+curl -X GET "https://${API_PUBLIC_HOST}/api/v1/admin/pricing/history?client_id=00000000-0000-0000-0000-000000000000" \
   -H "Authorization: Bearer <ADMIN_KEY>"
 ```

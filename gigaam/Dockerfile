@@ -7,6 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/app/data \
     TORCH_HOME=/app/data/torch
 
+RUN groupadd -r -g 1001 oaitt && useradd -r -u 1001 -g oaitt oaitt
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
@@ -39,8 +41,12 @@ RUN pip install --no-cache-dir --no-deps /app/vendor/gigaam && \
 # Copy GigaAM models pre-downloaded on host
 COPY data/gigaam/ /app/data/gigaam/
 
-# Copy application files
+COPY shared/ /app/shared/
 COPY gigaam/main.py .
+
+RUN mkdir -p /shared_data && chown -R oaitt:oaitt /app /shared_data
+
+USER oaitt
 
 EXPOSE 9007
 

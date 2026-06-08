@@ -67,7 +67,7 @@ When no tariff exists for a client/period, `pricing_options` is `{}` and totals 
 ### Example Request (client, date range)
 
 ```bash
-curl -X GET "https://api.yourdomain.com/api/v1/analytics/summary?from=2026-05-01&to=2026-05-31" \
+curl -X GET "https://${API_PUBLIC_HOST}/api/v1/analytics/summary?from=2026-05-01&to=2026-05-31" \
      -H "Authorization: Bearer <your_api_key>" \
      -H "Accept: application/json"
 ```
@@ -75,7 +75,7 @@ curl -X GET "https://api.yourdomain.com/api/v1/analytics/summary?from=2026-05-01
 ### Example Request (admin, specific client)
 
 ```bash
-curl -X GET "https://api.yourdomain.com/api/v1/analytics/summary?from=2026-05-01&to=2026-06-01&client_id=00000000-0000-0000-0000-000000000000" \
+curl -X GET "https://${API_PUBLIC_HOST}/api/v1/analytics/summary?from=2026-05-01&to=2026-06-01&client_id=00000000-0000-0000-0000-000000000000" \
      -H "Authorization: Bearer <ADMIN_KEY>" \
      -H "Accept: application/json"
 ```

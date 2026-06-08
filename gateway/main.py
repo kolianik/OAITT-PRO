@@ -1,10 +1,22 @@
 import os
+import sys
 import time
 import logging
 import asyncio
 import httpx
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from shared.security import (
+    internal_service_headers,
+    normalize_audio_extension,
+    resolve_shared_data_path,
+    safe_remove_shared_path,
+    validate_shared_path,
+    validate_webhook_url,
+)
 from fastapi import FastAPI, Depends, File, Form, Query, UploadFile, HTTPException, Security, status, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -94,7 +106,14 @@ class PricingCreateRequest(BaseModel):
 
 # Webhook delivery function
 async def fire_webhook(url: str, job_id: str, status_str: str, result: Optional[dict], error_message: Optional[str]):
-    logger.info(f"Sending webhook for job {job_id} to {url}...")
+    try:
+        validated_url = validate_webhook_url(url)
+    except ValueError as exc:
+        logger.error("Invalid webhook URL for job %s: %s", job_id, exc)
+        return
+
+    webhook_host = urlparse(validated_url).hostname or "unknown"
+    logger.info("Sending webhook for job %s to host %s", job_id, webhook_host)
     payload = {
         "job_id": job_id,
         "status": status_str,
@@ -102,16 +121,21 @@ async def fire_webhook(url: str, job_id: str, status_str: str, result: Optional[
         "error_message": error_message
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-            logger.info(f"Webhook delivered, status code: {resp.status_code}")
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            resp = await client.post(validated_url, json=payload)
+            logger.info("Webhook delivered for job %s, status code: %s", job_id, resp.status_code)
     except Exception as e:
-        logger.error(f"Failed to deliver webhook to {url}: {e}")
+        logger.error("Failed to deliver webhook for job %s to host %s: %s", job_id, webhook_host, e)
 
 # Async Background Worker Job Processor
 async def process_job(job: dict):
     job_id = job["id"]
-    file_path = job["file_path"]
+    try:
+        file_path = validate_shared_path(job["file_path"])
+    except ValueError:
+        logger.error("Invalid file path for job %s", job_id)
+        await update_job_failure(job_id, "Invalid file path")
+        return
     engine = job["engine"]
     target_url = GIGAAM_URL if engine == "gigaam" else WHISPERX_URL
     start_time = time.perf_counter()
@@ -145,20 +169,24 @@ async def process_job(job: dict):
                     "diarize": "true" if job["diarization_enabled"] else "false"
                 }
                 
-                logger.info(f"Commanding {engine} backend to transcribe local file {file_path} for job {job_id}...")
-                resp = await httpx_client.post(f"{target_url}/v1/audio/transcriptions/local", json=data)
+                logger.info("Commanding %s backend to transcribe job %s", engine, job_id)
+                resp = await httpx_client.post(
+                    f"{target_url}/v1/audio/transcriptions/local",
+                    json=data,
+                    headers=internal_service_headers(),
+                )
                 
                 if resp.status_code != 200:
                     status_str = "failed"
-                    error_msg = f"Inference engine returned status {resp.status_code}: {resp.text}"
-                    logger.error(error_msg)
+                    error_msg = f"Inference engine returned status {resp.status_code}"
+                    logger.error("%s for job %s: %s", error_msg, job_id, resp.text)
                 else:
                     resp_json = resp.json()
                     
         except Exception as exc:
             status_str = "failed"
-            error_msg = f"Request to inference engine failed: {exc}"
-            logger.error(error_msg)
+            error_msg = "Request to inference engine failed"
+            logger.error("%s for job %s: %s", error_msg, job_id, exc)
             
     # Process transcription outcome (outside gpu_lock to release GPU immediately for other jobs!)
     processing_time = time.perf_counter() - start_time
@@ -247,17 +275,18 @@ async def process_job(job: dict):
             )
             
     except Exception as e:
-        logger.error(f"Error post-processing job {job_id}: {e}", exc_info=True)
-        await update_job_failure(job_id, f"Post-processing error: {e}")
+        logger.error("Error post-processing job %s: %s", job_id, e, exc_info=True)
+        await update_job_failure(job_id, "Post-processing error")
         
     finally:
         # Guarantee removal of local media file from shared storage to avoid leakage!
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                logger.info(f"Cleaned up local file: {file_path}")
-            except Exception as e:
-                logger.error(f"Failed to delete local file {file_path}: {e}")
+        try:
+            safe_remove_shared_path(file_path)
+            logger.info("Cleaned up local file for job %s", job_id)
+        except (ValueError, FileNotFoundError):
+            pass
+        except OSError as e:
+            logger.error("Failed to delete local file for job %s: %s", job_id, e)
                 
         # Fire webhook if provided
         if job["webhook_url"]:
@@ -295,18 +324,25 @@ async def cleanup_loop():
             if os.path.exists("/shared_data"):
                 now = time.time()
                 for filename in os.listdir("/shared_data"):
+                    if ".." in filename or "/" in filename or "\\" in filename:
+                        continue
                     file_path = os.path.join("/shared_data", filename)
-                    if os.path.isfile(file_path):
-                        mtime = os.path.getmtime(file_path)
-                        # If file is older than 24 hours, delete it
-                        if now - mtime > 86400:
-                            is_active = await is_file_active_in_db(file_path)
-                            if not is_active:
-                                try:
-                                    os.remove(file_path)
-                                    logger.info(f"Auto-cleaned orphaned file from shared storage: {file_path}")
-                                except Exception as e:
-                                    logger.warning(f"Failed to auto-clean file {file_path}: {e}")
+                    if not os.path.isfile(file_path):
+                        continue
+                    try:
+                        validated_path = validate_shared_path(file_path)
+                    except ValueError:
+                        continue
+                    mtime = os.path.getmtime(validated_path)
+                    # If file is older than 24 hours, delete it
+                    if now - mtime > 86400:
+                        is_active = await is_file_active_in_db(validated_path)
+                        if not is_active:
+                            try:
+                                safe_remove_shared_path(validated_path)
+                                logger.info("Auto-cleaned orphaned file from shared storage")
+                            except (ValueError, OSError) as e:
+                                logger.warning("Failed to auto-clean orphaned file: %s", e)
         except asyncio.CancelledError:
             logger.info("Cleanup loop cancelled")
             break
@@ -336,15 +372,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="OAITT-PRO Gateway Orchestrator",
     description="Gateway Orchestrator with security, analytics logging, and VRAM management.",
-    version="1.1.0",
+    version="1.1.1",
     lifespan=lifespan
 )
 
 async def unload_engine(engine_name: str, base_url: str):
-    logger.info(f"Commanding {engine_name} at {base_url} to UNLOAD weights from VRAM...")
+    logger.info("Commanding %s to UNLOAD weights from VRAM", engine_name)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(f"{base_url}/unload")
+            resp = await client.post(f"{base_url}/unload", headers=internal_service_headers())
             if resp.status_code == 200:
                 logger.info(f"Successfully unloaded {engine_name}")
             else:
@@ -370,12 +406,21 @@ async def openai_transcribe_async(
     
     logger.info(f"Client {client['name']} ({client['id']}) requested ASYNC transcription with model: {model} (Engine: {requested_engine}, diarize={diarize})")
     
+    if webhook_url:
+        try:
+            webhook_url = validate_webhook_url(webhook_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # Generate UUID for job
     job_id = str(uuid.uuid4())
     
     # Stream file upload chunk-by-chunk to the shared volume to avoid loading it entirely in memory
-    file_ext = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
-    file_path = f"/shared_data/{job_id}{file_ext}"
+    try:
+        file_ext = normalize_audio_extension(file.filename)
+        file_path = resolve_shared_data_path(job_id, file_ext)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     
     try:
         with open(file_path, "wb") as f:
@@ -385,10 +430,12 @@ async def openai_transcribe_async(
                     break
                 f.write(chunk)
     except Exception as e:
-        logger.error(f"Error saving uploaded file: {e}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
+        logger.error("Error saving uploaded file for job %s: %s", job_id, e)
+        try:
+            safe_remove_shared_path(file_path)
+        except (ValueError, FileNotFoundError, OSError):
+            pass
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
         
     # Create database entry
     try:
@@ -417,10 +464,12 @@ async def openai_transcribe_async(
             }
         )
     except Exception as e:
-        logger.error(f"Failed to create transcription job in database: {e}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=500, detail=f"Failed to queue transcription job: {str(e)}")
+        logger.error("Failed to create transcription job in database: %s", e)
+        try:
+            safe_remove_shared_path(file_path)
+        except (ValueError, FileNotFoundError, OSError):
+            pass
+        raise HTTPException(status_code=500, detail="Failed to queue transcription job")
 
 @app.get("/v1/audio/transcriptions/status/{job_id}")
 async def get_job_status(

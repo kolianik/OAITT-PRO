@@ -1,3 +1,4 @@
+# Master process starts as root to bind ports 80/443; workers run as nginx (see nginx.conf).
 FROM nginx:alpine
 
 RUN apk add --no-cache openssl

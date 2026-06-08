@@ -53,7 +53,7 @@ JSON **array** of objects, one per client with activity in the period:
 ## Example
 
 ```bash
-curl -X GET "https://api.yourdomain.com/api/v1/admin/analytics/by-client?from=2026-05-01&to=2026-06-01" \
+curl -X GET "https://${API_PUBLIC_HOST}/api/v1/admin/analytics/by-client?from=2026-05-01&to=2026-06-01" \
   -H "Authorization: Bearer <ADMIN_KEY>" \
   -H "Accept: application/json"
 ```

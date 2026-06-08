@@ -1,13 +1,21 @@
 import os
+import sys
 import gc
 import tempfile
 import logging
 import torch
 import soundfile as sf
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status, Header, Depends
 from fastapi.responses import JSONResponse
 from typing import Optional, List
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from shared.security import (
+    INTERNAL_TOKEN_HEADER,
+    validate_shared_path,
+    verify_internal_service_token,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("gigaam-service")
@@ -48,6 +56,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 app = FastAPI(title="GigaAM Inference & Diarization Service", version="1.0.0")
 
+
+async def require_internal_service(
+    x_internal_service_token: Optional[str] = Header(None, alias=INTERNAL_TOKEN_HEADER),
+) -> None:
+    try:
+        verify_internal_service_token(x_internal_service_token)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden") from exc
+
 # Loaded Models (Lazy)
 gigaam_model = None
 diarize_pipeline = None
@@ -85,7 +102,7 @@ def load_diarize_pipeline_if_needed():
         logger.info("Diarization pipeline loaded successfully")
 
 @app.post("/unload")
-async def unload_models():
+async def unload_models(_auth: None = Depends(require_internal_service)):
     global gigaam_model, diarize_pipeline
     
     logger.info("Received request to UNLOAD GigaAM and Pyannote models from memory...")
@@ -311,21 +328,26 @@ class LocalTranscribeRequest(BaseModel):
     diarize: str = "false"
 
 @app.post("/v1/audio/transcriptions/local")
-async def transcribe_local(req: LocalTranscribeRequest):
-    logger.info(f"Received local transcription request for file_path: {req.file_path}, diarize: {req.diarize}")
-    if not os.path.exists(req.file_path):
-         raise HTTPException(status_code=400, detail=f"File not found on shared storage: {req.file_path}")
+async def transcribe_local(
+    req: LocalTranscribeRequest,
+    _auth: None = Depends(require_internal_service),
+):
+    logger.info("Received local transcription request, diarize: %s", req.diarize)
+    try:
+        safe_path = validate_shared_path(req.file_path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="File not found on shared storage")
     try:
          result = process_transcription_from_file(
-             req.file_path,
+             safe_path,
              req.language,
              req.response_format,
              req.diarize
          )
          return JSONResponse(content=result)
     except Exception as e:
-         logger.error(f"Error during local transcription: {e}", exc_info=True)
-         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+         logger.error("Error during local transcription: %s", e, exc_info=True)
+         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Transcription failed")
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
@@ -353,8 +375,8 @@ async def transcribe(
         return JSONResponse(content=result)
         
     except Exception as e:
-        logger.error(f"Error during transcription: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+        logger.error("Error during transcription: %s", e, exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Transcription failed")
         
     finally:
         # Clean up temporary audio file

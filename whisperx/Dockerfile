@@ -12,21 +12,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN python3 -m ensurepip --upgrade
 
 # Install web-service requirements and pyannote
-COPY requirements.txt .
+COPY whisperx/requirements.txt .
 RUN python3 -m pip install --no-cache-dir \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
     -r requirements.txt
 
-# Create cache directory
-RUN mkdir -p /app/data
+# Create cache and shared directories (base image user: whisperx uid 1001)
+RUN mkdir -p /app/data /shared_data
 
-# Copy pre-downloader and run it to bake models
-COPY download_models.py .
-# RUN python download_models.py
+COPY shared/ /app/shared/
+COPY whisperx/main.py .
 
-# Copy application files
-COPY main.py .
+RUN chown -R whisperx:whisperx /app /shared_data
+
+USER whisperx
 
 EXPOSE 9007
 

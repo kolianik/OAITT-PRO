@@ -30,7 +30,7 @@ The endpoint returns a JSON object with the following fields:
 
 ### Example Request (cURL)
 ```bash
-curl -X GET "https://api.yourdomain.com/health" -H "Accept: application/json"
+curl -X GET "https://${API_PUBLIC_HOST}/health" -H "Accept: application/json"
 ```
 
 ### Example Successful Response (`200 OK`)
