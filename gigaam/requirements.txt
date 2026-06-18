@@ -1,12 +1,8 @@
-fastapi>=0.110.0
-uvicorn>=0.28.0
-pydantic>=2.6.0
-python-multipart>=0.0.9
-pyannote.audio>=4.0.0
-hydra-core
-omegaconf
-sentencepiece
-soundfile
-librosa
-scipy
-numpy>=2.1.0,<2.3.0
+# Docker image installs via staged install_deps.sh (avoids pip resolution-too-deep).
+# For local dev, install in the same order:
+-r requirements-web.txt
+-r requirements-onnx.txt
+# torchcodec + nvidia-npp-cu12: use pytorch cu128 index with constraints.txt
+-r requirements-audio.txt
+pyannote.audio==4.0.4
+-r requirements-ml.txt

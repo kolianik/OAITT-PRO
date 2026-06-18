@@ -86,6 +86,29 @@ async def test_async_job_creation(mock_create_job, mock_auth, client):
     assert call_args_dict["max_chars_per_second"] is None
     assert call_args_dict["webhook_url"] == "https://callback.io"
 
+
+@pytest.mark.asyncio
+@patch("gateway.main.authenticate_client", new_callable=AsyncMock)
+@patch("gateway.main.create_transcription_job", new_callable=AsyncMock)
+async def test_async_job_creation_gigaam(mock_create_job, mock_auth, client):
+    """Verify model=gigaam routes to gigaam engine with v3_e2e_rnnt."""
+    mock_auth.return_value = {"id": "test-client-uuid", "name": "Test Client", "role": "client"}
+    mock_create_job.return_value = "mocked-gigaam-job"
+
+    with patch("os.makedirs"), patch("builtins.open", MagicMock()):
+        response = client.post(
+            "/v1/audio/transcriptions/async",
+            files={"file": ("test.wav", b"fake audio content")},
+            data={"model": "gigaam", "diarize": "false"},
+            headers={"Authorization": "Bearer valid-token"},
+        )
+
+    assert response.status_code == 202
+    call_args_dict = mock_create_job.call_args[1]
+    assert call_args_dict["engine"] == "gigaam"
+    assert call_args_dict["model_name"] == "v3_e2e_rnnt"
+
+
 @pytest.mark.asyncio
 @patch("gateway.main.authenticate_client", new_callable=AsyncMock)
 @patch("gateway.main.create_transcription_job", new_callable=AsyncMock)
@@ -331,3 +354,66 @@ async def test_admin_by_client_requires_admin(mock_by_client, mock_auth, client)
     )
     assert response.status_code == 403
     mock_by_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gateway.main.safe_remove_shared_path")
+@patch("gateway.main.fire_webhook", new_callable=AsyncMock)
+@patch("gateway.main.log_transcription", new_callable=AsyncMock)
+@patch("gateway.main.update_job_success", new_callable=AsyncMock)
+@patch("gateway.main.validate_shared_path")
+@patch("gateway.main.httpx.AsyncClient")
+async def test_process_job_stores_completed_status(
+    mock_httpx_cls, mock_validate_path, mock_update_job, mock_log, mock_webhook, mock_rm
+):
+    """BUG-005: worker must persist 'completed', not 'success' (API_transcriptions.md Case B)."""
+    import gateway.main as gw
+
+    gw.current_gpu_engine = None
+
+    mock_validate_path.return_value = "/shared_data/job.wav"
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "text": "Привет мир",
+        "duration": 3.0,
+        "segments": [{"id": 0, "start": 0.0, "end": 3.0, "text": "Привет мир", "avg_logprob": -0.1}],
+    }
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_cm)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_cm.post = AsyncMock(return_value=fake_resp)
+    mock_httpx_cls.return_value = mock_cm
+
+    job = {
+        "id": "test-job-id",
+        "client_id": "test-client-uuid",
+        "filename": "job.wav",
+        "file_path": "/shared_data/job.wav",
+        "engine": "gigaam",
+        "model_name": "v3_e2e_rnnt",
+        "diarization_enabled": False,
+        "language": None,
+        "response_format": "json",
+        "min_avg_logprob": None,
+        "max_chars_per_second": None,
+        "webhook_url": "https://callback.example.com/hook",
+    }
+
+    await gw.process_job(job)
+
+    # The DB record must use 'completed', not 'success'
+    assert mock_update_job.called
+    _, status_arg = mock_update_job.call_args[0][0], mock_update_job.call_args[0][2]
+    assert status_arg == "completed", f"Expected 'completed', got '{status_arg}'"
+
+    # Analytics log must also use 'completed'
+    assert mock_log.called
+    log_status = mock_log.call_args[1]["status"]
+    assert log_status == "completed", f"Expected 'completed', got '{log_status}'"
+
+    # Webhook payload must carry 'completed'
+    assert mock_webhook.called
+    webhook_status = mock_webhook.call_args[0][2]
+    assert webhook_status == "completed", f"Expected 'completed', got '{webhook_status}'"

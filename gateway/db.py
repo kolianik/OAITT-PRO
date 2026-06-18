@@ -376,7 +376,7 @@ async def get_analytics_summary(
                 COALESCE(SUM(audio_duration_seconds), 0) as total_audio_duration_seconds,
                 COALESCE(SUM(speech_duration_seconds), 0) as total_speech_duration_seconds,
                 COALESCE(SUM(processing_time_seconds), 0) as total_processing_seconds,
-                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END)::float
+                SUM(CASE WHEN status IN ('success', 'completed') THEN 1 ELSE 0 END)::float
                     / NULLIF(COUNT(*), 0) as success_rate
             FROM transcription_logs
             {where_sql}
@@ -422,7 +422,7 @@ async def get_analytics_by_client(
                 COALESCE(SUM(tl.audio_duration_seconds), 0) AS total_audio_duration_seconds,
                 COALESCE(SUM(tl.speech_duration_seconds), 0) AS total_speech_duration_seconds,
                 COALESCE(SUM(tl.processing_time_seconds), 0) AS total_processing_seconds,
-                SUM(CASE WHEN tl.status = 'success' THEN 1 ELSE 0 END)::float
+                SUM(CASE WHEN tl.status IN ('success', 'completed') THEN 1 ELSE 0 END)::float
                     / NULLIF(COUNT(*), 0) AS success_rate,
                 COALESCE(SUM(tl.audio_duration_seconds), 0) / 60.0 AS audio_minutes,
                 COALESCE(SUM(tl.speech_duration_seconds), 0) / 60.0 AS speech_minutes,

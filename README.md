@@ -1,6 +1,6 @@
 # OAITT-PRO — Open AI Transformer Transcriber PRO
 
-**Version:** 1.1.1
+**Version:** 1.3.0
 
 Highly optimized speech-to-text service with advanced speaker diarization and dynamic VRAM management on a **single NVIDIA GPU** in **FP16**. Validated on **RTX 3060 (12 GB VRAM)**; **RTX 3080 (10 GB)** is supported with `WHISPERX_BATCH_SIZE` tuning (see [INSTALL.md](INSTALL.md) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
@@ -10,21 +10,25 @@ Highly optimized speech-to-text service with advanced speaker diarization and dy
 
 For a full Ubuntu 24.04 LTS install guide, see **[INSTALL.md](INSTALL.md)**.
 
-1. **Clone, prepare models, and configure environment**
+1. **Clone and configure environment**
 
 ```bash
 git clone <your-repo-url>
 cd Transcribe_server
-./prepare.sh
 cp .env.example .env
 ```
+
+Optional: `./prepare.sh` to prefetch GigaAM PyTorch weights on the host (air-gapped seed). On first `docker compose up`, `gigaam-service` bootstraps models into the `gigaam_model_cache` volume automatically (wait until healthy).
 
 Edit `.env`: set `HF_TOKEN`, `ADMIN_KEY`, `POSTGRES_PASSWORD`, `API_PUBLIC_HOST`, `API_UPLOAD_HOST`, and ports. See [SECURITY.md](SECURITY.md) before production use.
 
 2. **Start the stack** (requires Docker, NVIDIA Container Toolkit, and a CUDA-capable GPU)
 
 ```bash
-docker compose up -d --build
+# Linux/macOS — use start.sh (Windows: .\start.ps1), not a bare `docker compose up`:
+# the start scripts strip loopback HTTP(S)_PROXY that would otherwise stall the
+# gigaam-service bootstrap. start.sh forwards extra args straight to Compose.
+./start.sh --build
 ```
 
 3. **Check health**
@@ -137,8 +141,15 @@ The system is configured via environment variables in `.env` (template: [.env.ex
 | `PROXY_PORT_HTTP` | `80` | HTTP port on the host (set to `3000` if that is your public upload port) |
 | `GATEWAY_PORT` | `9000` | Gateway host port (only with `docker-compose.debug.yml`) |
 | `INTERNAL_SERVICE_TOKEN` | — | Shared secret for gateway → inference calls (`openssl rand -hex 32`) |
-| `WHISPERX_MODEL` | `bzikst/faster-whisper-large-v3-russian` | WhisperX model |
-| `GIGAAM_MODEL` | `v3_e2e_rnnt` | GigaAM model |
+| `WHISPERX_MODEL` | `bzikst/faster-whisper-large-v3-russian` | WhisperX ASR model |
+| `WHISPERX_ALIGN_MODEL` | `jonatasgrosman/wav2vec2-xls-r-1b-russian` | Russian Wav2Vec2 for word-level alignment |
+| `GIGAAM_MODEL` | `v3_e2e_rnnt` | GigaAM ONNX ASR model |
+| `GIGAAM_ALIGN_MODEL` | `jonatasgrosman/wav2vec2-xls-r-1b-russian` | Wav2Vec2 for GigaAM word alignment |
+| `GIGAAM_BATCH_SIZE` | `4` | ONNX ASR batch size (lower on 10 GB VRAM) |
+| `GIGAAM_DIARIZE_BATCH_SIZE` | `8` | Pyannote segmentation batch size; lower caps diarization peak VRAM (RTX 3060 6 GB) |
+| `GIGAAM_DENOISE` | `true` | DeepFilterNet3 on clean ASR path (weights auto-downloaded to volume at bootstrap) |
+| `GIGAAM_DENOISE_MODEL` | `DeepFilterNet3` | Denoise model name |
+| `GIGAAM_DEEPFILTER_DIR` | `/app/data/deepfilter` | Volume path for DeepFilterNet3 weights (override if needed) |
 | `DEVICE` | `cuda` | `cuda` or `cpu` |
 | `WHISPERX_COMPUTE_TYPE` | `float16` | **CUDA: float16 only** (int8 not supported) |
 | `WHISPERX_BATCH_SIZE` | `4` | Transcribe batch size; lower to reduce VRAM without changing model quality |
@@ -152,6 +163,23 @@ Never commit `.env` or operational scripts with real credentials. See [SECURITY.
 If you are running behind NAT with a single open port, set `PROXY_PORT_HTTPS` in `.env` and use Cloudflare **Origin Rules** to route HTTPS (443) to your custom port.
 
 See **[TROUBLESHOOTING.md — NAT & Cloudflare](TROUBLESHOOTING.md#-3-nat--single-port-deployment-via-cloudflare)**.
+
+---
+
+## Network scenarios & proxies
+
+Clean install works on three networks, handled automatically by `scripts/netprep.{sh,ps1}` (run by the
+start/build scripts):
+
+- **Direct internet** — zero config (`OAITT_PROXY_MODE=direct`).
+- **System proxy only** — auto-discovered (incl. Windows WinINET/WinHTTP); a loopback `127.0.0.1` proxy
+  is auto-translated to `http://host.docker.internal:<port>`; if direct works, the proxy is disabled.
+- **Corporate TLS interception (MITM)** — run `detect-corp-ca.{sh,ps1}`, verify the fingerprint, set
+  `CORP_CA_AUTO_TRUST=1`; the corporate root CA is trusted across build, runtime, and host tooling
+  (verification stays on).
+
+See **[INSTALL.md — Network scenarios](INSTALL.md#6-network-scenarios--proxies-s1--s2--s3)** and
+**[SECURITY.md](SECURITY.md#corporate-tls-interception-mitm)**.
 
 ---
 

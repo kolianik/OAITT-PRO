@@ -1,0 +1,26 @@
+# First-run model-provisioning override (Scenario S1 — direct internet, no proxy).
+#
+# gigaam-service normally sits ONLY on inference_net (internal: true), which has no external
+# DNS/egress by design (see SECURITY.md). With direct internet and no proxy there is no host
+# proxy to route through, so the very first bootstrap (GigaAM Sber-CDN weights, HF alignment,
+# Pyannote) cannot reach the internet. This override adds a temporary, egress-only network to
+# gigaam-service for the initial download, then you return to the strict-internal stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.bootstrap.yml up -d gigaam-service
+#   # wait until healthy:  docker compose ps   (models are now cached on the volume)
+#   ./start.sh            # or: docker compose up -d   (strict internal, offline thereafter)
+#
+# bootstrap_net is NOT internal and is joined ONLY by gigaam-service; it never touches
+# backend_net or edge_net, so the production segmentation is otherwise unchanged.
+# Behind a system proxy (S2) or corporate MITM (S3) this override is NOT needed — gigaam reaches
+# the internet through the host proxy at host.docker.internal even on the internal network.
+
+networks:
+  bootstrap_net:
+
+services:
+  gigaam-service:
+    networks:
+      - inference_net
+      - bootstrap_net

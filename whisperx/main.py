@@ -52,6 +52,10 @@ except Exception as e:
 
 # Configuration
 WHISPER_MODEL_NAME = os.getenv("WHISPERX_MODEL", "bzikst/faster-whisper-large-v3-russian")
+ALIGN_MODEL_NAME = os.getenv(
+    "WHISPERX_ALIGN_MODEL",
+    "jonatasgrosman/wav2vec2-xls-r-1b-russian",
+)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", os.getenv("WHISPERX_COMPUTE_TYPE", "float16"))
 if DEVICE == "cuda" and COMPUTE_TYPE != "float16":
@@ -102,10 +106,13 @@ def load_models_if_needed():
         logger.info("WhisperX model loaded successfully")
         
     if align_model is None:
-        logger.info("Loading alignment model for Russian ('ru')...")
+        logger.info(f"Loading alignment model '{ALIGN_MODEL_NAME}' for Russian ('ru')...")
         align_model, align_metadata = whisperx.load_align_model(
             language_code="ru",
-            device=DEVICE
+            device=DEVICE,
+            model_name=ALIGN_MODEL_NAME,
+            model_dir="/app/data",
+            model_cache_only=True,
         )
         logger.info("Alignment model loaded successfully")
 
@@ -298,6 +305,8 @@ async def health_check():
     return {
         "status": "healthy",
         "device": DEVICE,
+        "whisper_model": WHISPER_MODEL_NAME,
+        "align_model": ALIGN_MODEL_NAME,
         "whisper_model_loaded": whisper_model is not None,
         "align_model_loaded": align_model is not None,
         "diarize_pipeline_loaded": diarize_pipeline is not None

@@ -94,7 +94,10 @@ curl -X POST "https://${API_UPLOAD_HOST}:${PROXY_PORT_HTTP}/v1/audio/transcripti
         "end": 4.2,
         "text": "Привет! Как твои дела?",
         "speaker": "SPEAKER_00",
-        "avg_logprob": -0.12
+        "avg_logprob": -0.12,
+        "words": [
+          {"word": "привет", "start": 0.1, "end": 0.5, "probability": 0.92, "tag": null}
+        ]
       },
       {
         "id": 1,
@@ -108,6 +111,19 @@ curl -X POST "https://${API_UPLOAD_HOST}:${PROXY_PORT_HTTP}/v1/audio/transcripti
   }
 }
 ```
+
+#### GigaAM-specific result fields
+
+When `model=gigaam`:
+
+| Field | Description |
+| :--- | :--- |
+| `segments[].words[]` | Optional per-word timestamps from Wav2Vec2 alignment (`word`, `start`, `end`, `probability`, `tag`). |
+| `segments[].words[].tag` | `"low_conf"` if alignment score 0.15–0.60; `"unaligned"` for out-of-vocabulary tokens; otherwise `null`. |
+| `segments[].speaker` | Set when `diarize=true`. Backchannel words get the shorter overlapping speaker (not `UNKNOWN_OVERLAP`). `UNKNOWN_SPEAKER` if no diarization overlap. `null` when `diarize=false`. |
+| `segments[].avg_logprob` | Proxy confidence `log(mean(word.score))` for gateway anti-hallucination filters. |
+
+> **Diarization availability (GigaAM):** `diarize=true` requires the GigaAM service to have `HF_TOKEN` configured and the Pyannote model prefetched. On a deployment without it, the job fails fast with `error_message` like *"Inference engine returned status 400: Diarization requested but unavailable …"*. Transcription without diarization is unaffected.
 
 #### Case C: Job failed (`200 OK`):
 ```json

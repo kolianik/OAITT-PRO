@@ -1,0 +1,2 @@
+silero-vad==6.2.1
+deepfilternet==0.5.6

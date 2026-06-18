@@ -151,7 +151,7 @@ async def process_job(job: dict):
         current_gpu_engine = engine
         
         # Initialize job variables
-        status_str = "success"
+        status_str = "completed"
         error_msg = None
         audio_duration = 0.0
         speech_duration = 0.0
@@ -192,7 +192,7 @@ async def process_job(job: dict):
     processing_time = time.perf_counter() - start_time
     
     try:
-        if status_str == "success":
+        if status_str == "completed":
             transcription_text = resp_json.get("text", "")
             char_count = len(transcription_text)
             audio_duration = float(resp_json.get("duration", 0.0))
@@ -290,7 +290,7 @@ async def process_job(job: dict):
                 
         # Fire webhook if provided
         if job["webhook_url"]:
-            await fire_webhook(job["webhook_url"], job_id, status_str, resp_json if status_str in ("success", "hallucination_filtered") else None, error_msg)
+            await fire_webhook(job["webhook_url"], job_id, status_str, resp_json if status_str in ("completed", "hallucination_filtered") else None, error_msg)
 
 async def background_worker_loop():
     logger.info("Starting background worker loop...")

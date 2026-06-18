@@ -1,14 +1,16 @@
 import os
 import sys
 import gc
+import asyncio
 import tempfile
 import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
 import torch
-import soundfile as sf
-import numpy as np
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, status, Header, Depends
 from fastapi.responses import JSONResponse
-from typing import Optional, List
+from pydantic import BaseModel
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from shared.security import (
@@ -16,17 +18,20 @@ from shared.security import (
     validate_shared_path,
     verify_internal_service_token,
 )
+from pipeline.orchestrator import run_pipeline
+from pipeline.diarization import reset_diarization_pipeline
+from bootstrap_state import STATE
+from bootstrap_models import CacheIncompleteError, ensure_models
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("gigaam-service")
 
-# PyTorch weights_only patching for Pyannote model loading
 try:
     import collections
     import typing
     import omegaconf
     import pyannote.audio
-    
+
     safe_globals = [
         omegaconf.listconfig.ListConfig,
         omegaconf.base.ContainerMetadata,
@@ -49,12 +54,59 @@ try:
 except Exception as e:
     logger.warning(f"Could not configure safe torch globals: {e}")
 
-# Configuration
 GIGAAM_MODEL_NAME = os.getenv("GIGAAM_MODEL", "v3_e2e_rnnt")
+GIGAAM_ALIGN_MODEL = os.getenv(
+    "GIGAAM_ALIGN_MODEL", "jonatasgrosman/wav2vec2-xls-r-1b-russian"
+)
+GIGAAM_ONNX_DIR = os.getenv("GIGAAM_ONNX_DIR", "/app/data/gigaam_onnx")
+GIGAAM_BATCH_SIZE = max(1, int(os.getenv("GIGAAM_BATCH_SIZE", "4")))
+GIGAAM_DIARIZE_BATCH_SIZE = max(1, int(os.getenv("GIGAAM_DIARIZE_BATCH_SIZE", "8")))
+GIGAAM_DENOISE = os.getenv("GIGAAM_DENOISE", "true").lower() in ("1", "true", "yes")
+GIGAAM_DENOISE_MODEL = os.getenv("GIGAAM_DENOISE_MODEL", "DeepFilterNet3")
+GIGAAM_DENOISE_DEVICE = os.getenv("GIGAAM_DENOISE_DEVICE", "cuda")
+GIGAAM_DENOISE_CHUNK_SEC = float(os.getenv("GIGAAM_DENOISE_CHUNK_SEC", "30"))
+GIGAAM_DENOISE_OVERLAP_SEC = float(os.getenv("GIGAAM_DENOISE_OVERLAP_SEC", "2"))
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-app = FastAPI(title="GigaAM Inference & Diarization Service", version="1.0.0")
+
+async def _run_bootstrap() -> None:
+    try:
+        await asyncio.to_thread(ensure_models, STATE)
+    except CacheIncompleteError:
+        logger.error("Model bootstrap failed: %s", STATE.message)
+    except Exception as exc:
+        logger.exception("Unexpected bootstrap error: %s", exc)
+        STATE.update(
+            status="failed",
+            ready=False,
+            message=f"Ошибка инициализации кэша моделей: {exc}",
+            error=str(exc),
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_run_bootstrap())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(
+    title="GigaAM Inference & Diarization Service",
+    version="1.2.1",
+    lifespan=lifespan,
+)
+
+# Single-flight GPU guard: only one transcription runs at a time. Combined with
+# asyncio.to_thread in the handlers, this keeps the event loop (and GET /health)
+# responsive while a job occupies the GPU, and prevents concurrent use of the
+# shared per-stage model singletons in pipeline/*. See agents.md §2.5.
+PIPELINE_LOCK = asyncio.Lock()
 
 
 async def require_internal_service(
@@ -65,261 +117,64 @@ async def require_internal_service(
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden") from exc
 
-# Loaded Models (Lazy)
-gigaam_model = None
-diarize_pipeline = None
 
-def load_gigaam_model_if_needed():
-    global gigaam_model
-    if gigaam_model is None:
-        try:
-            import gigaam
-            logger.info(f"Loading GigaAM model '{GIGAAM_MODEL_NAME}' on {DEVICE}...")
-            gigaam_model = gigaam.load_model(
-                model_name=GIGAAM_MODEL_NAME,
-                fp16_encoder=True if DEVICE.type == "cuda" else False,
-                use_flash=False,
-                device=DEVICE,
-                download_root="/app/data/gigaam"
-            )
-            logger.info("GigaAM model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load GigaAM model: {e}", exc_info=True)
-            raise RuntimeError(f"Failed to load GigaAM model: {e}")
+async def require_models_ready() -> None:
+    if STATE.ready:
+        return
+    body = STATE.to_health_dict(
+        device=str(DEVICE),
+        onnx_dir=GIGAAM_ONNX_DIR,
+        denoise_enabled=GIGAAM_DENOISE,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=body,
+    )
 
-def load_diarize_pipeline_if_needed():
-    global diarize_pipeline
-    if diarize_pipeline is None:
-        if not HF_TOKEN:
-            raise ValueError("HF_TOKEN is required for Pyannote Diarization in GigaAM Service")
-        from pyannote.audio import Pipeline
-        logger.info("Loading Pyannote Diarization Pipeline (pyannote/speaker-diarization-community-1)...")
-        diarize_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-community-1",
-            token=HF_TOKEN
+
+def _ensure_diarization_available(diarize: str) -> None:
+    """Reject diarize=true early when this deployment cannot diarize (agents.md §2.5).
+
+    A ready service has Pyannote cached iff HF_TOKEN was set at bootstrap, so the
+    runtime check is HF_TOKEN present AND STATE.pyannote_cached.
+    """
+    if diarize.strip().lower() != "true":
+        return
+    if not HF_TOKEN or not STATE.pyannote_cached:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Diarization requested but unavailable on this GigaAM deployment "
+                "(requires HF_TOKEN and a prefetched Pyannote model)."
+            ),
         )
-        diarize_pipeline.to(DEVICE)
-        logger.info("Diarization pipeline loaded successfully")
 
-@app.post("/unload")
-async def unload_models(_auth: None = Depends(require_internal_service)):
-    global gigaam_model, diarize_pipeline
-    
-    logger.info("Received request to UNLOAD GigaAM and Pyannote models from memory...")
-    
-    gigaam_model = None
-    diarize_pipeline = None
-    
-    # Force Garbarge Collection and CUDA cleanups
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        
-    logger.info("Models successfully unloaded and GPU memory freed")
-    return {"status": "unloaded"}
-
-def transcribe_audio_tensor(audio_numpy: np.ndarray) -> str:
-    """Runs GigaAM transcription on a raw numpy array directly in GPU memory."""
-    global gigaam_model
-    
-    # 25s threshold padding/workaround to avoid MPS/CUDA memory leaks and maintain fixed shapes if short
-    original_len = len(audio_numpy)
-    max_samples = 25 * 16000 # 25 seconds
-    
-    if len(audio_numpy) < max_samples:
-        audio_numpy = np.pad(audio_numpy, (0, max_samples - len(audio_numpy)))
-        
-    wav_tensor = torch.from_numpy(audio_numpy).float().to(DEVICE)
-    wav = wav_tensor.unsqueeze(0)
-    length = torch.full([1], original_len, device=DEVICE)
-    
-    encoded = None
-    encoded_len = None
-    try:
-        # Run forward pass through GigaAM encoder & decoder
-        with torch.inference_mode():
-            encoded, encoded_len = gigaam_model.forward(wav, length)
-            result = gigaam_model.decoding.decode(gigaam_model.head, encoded, encoded_len)[0]
-    finally:
-        # Explicit cleanups of active tensors to prevent leakage
-        del wav, length, wav_tensor
-        if encoded is not None:
-            del encoded
-        if encoded_len is not None:
-            del encoded_len
-            
-    return result[0]
 
 def process_transcription_from_file(
     file_path: str,
     language: Optional[str],
     response_format: str,
-    diarize: str
+    diarize: str,
 ) -> dict:
     should_diarize = diarize.lower() == "true"
-    
-    # 1. Load GigaAM model
-    load_gigaam_model_if_needed()
-    
-    # 2. Read audio
-    logger.info("Reading audio file...")
-    import torchaudio
-    try:
-        waveform, sample_rate = torchaudio.load(file_path)
-        # Convert to mono by averaging channels
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        # Resample to 16000Hz if necessary
-        if sample_rate != 16000:
-            import torchaudio.functional as F
-            waveform = F.resample(waveform, orig_freq=sample_rate, new_freq=16000)
-        audio = waveform.squeeze(0).numpy()
-    except Exception as e:
-        logger.warning(f"Torchaudio failed to read file: {e}. Falling back to soundfile...")
-        audio, sample_rate = sf.read(file_path)
-        # Convert to mono if stereo
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1)
-        # Resample to 16000Hz if necessary
-        if sample_rate != 16000:
-            import librosa
-            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
-        
-    duration_seconds = len(audio) / 16000.0
-    logger.info(f"Audio loaded successfully. Duration: {duration_seconds:.2f}s")
-    
-    segments = []
-    
-    # 3. Handle diarization path (also used for longform splitting)
-    if should_diarize:
-        load_diarize_pipeline_if_needed()
-        logger.info("Running Pyannote speaker diarization...")
-        
-        # Convert to precise uncompressed WAV if not already WAV to prevent Pyannote sample mismatch on lossy formats (m4a, webm, mp3)
-        temp_wav_path = None
-        pyannote_file = file_path
-        if not file_path.lower().endswith(".wav"):
-            temp_wav_path = file_path + ".pyannote.wav"
-            logger.info(f"Converting file {file_path} to uncompressed WAV for Pyannote precision...")
-            import subprocess
-            try:
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", file_path,
-                    "-ar", "16000", "-ac", "1", temp_wav_path
-                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                pyannote_file = temp_wav_path
-            except Exception as e:
-                logger.warning(f"Failed to convert file to WAV with ffmpeg: {e}. Falling back to raw file path.")
-                
-        try:
-            pyannote_result = diarize_pipeline(pyannote_file)
-        finally:
-            # Guarantee clean up of temp wav file
-            if temp_wav_path and os.path.exists(temp_wav_path):
-                try:
-                    os.remove(temp_wav_path)
-                except Exception:
-                    pass
-        
-        # Extract speaker segments
-        raw_intervals = []
-        annotation = pyannote_result.speaker_diarization if hasattr(pyannote_result, "speaker_diarization") else pyannote_result
-        for turn, _, speaker in annotation.itertracks(yield_label=True):
-            raw_intervals.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": speaker
-            })
-            
-        logger.info(f"Diarization finished. Found {len(raw_intervals)} speaker turns.")
-        
-        # Split intervals that exceed GigaAM's 25-second limit
-        intervals = []
-        for interval in raw_intervals:
-            start = interval["start"]
-            end = interval["end"]
-            spk = interval["speaker"]
-            
-            while end - start > 20.0:
-                intervals.append({"start": start, "end": start + 20.0, "speaker": spk})
-                start += 20.0
-            if end - start > 0.1: # Skip negligible segments
-                intervals.append({"start": start, "end": end, "speaker": spk})
-                
-        if not intervals:
-            # Fallback: if no speech detected, transcribe whole file as one segment (up to 20s chunks)
-            logger.warning("No speech segments detected by Pyannote. Falling back to simple chunking.")
-            start = 0.0
-            while start < duration_seconds:
-                end = min(start + 20.0, duration_seconds)
-                intervals.append({"start": start, "end": end, "speaker": "UNKNOWN"})
-                start += 20.0
-                
-        # Transcribe each segment
-        for idx, interval in enumerate(intervals):
-            start_sec = interval["start"]
-            end_sec = interval["end"]
-            spk = interval["speaker"]
-            
-            start_sample = int(start_sec * 16000)
-            end_sample = int(end_sec * 16000)
-            chunk_audio = audio[start_sample:end_sample]
-            
-            if len(chunk_audio) < 160: # Skip extremely short segments (<10ms)
-                continue
-                
-            logger.info(f"Transcribing segment {idx+1}/{len(intervals)}: {start_sec:.2f}s - {end_sec:.2f}s (Speaker: {spk})...")
-            chunk_text = transcribe_audio_tensor(chunk_audio).strip()
-            
-            if chunk_text:
-                segments.append({
-                    "id": idx,
-                    "start": start_sec,
-                    "end": end_sec,
-                    "text": chunk_text,
-                    "speaker": spk,
-                    "avg_logprob": 0.0 # GigaAM doesn't easily expose token logprobs
-                })
-                
-    else:
-        # 4. Standard Non-Diarized path (Fixed 20-second chunking for long audio)
-        logger.info("Diarization disabled. Performing fixed 20-second chunking...")
-        start_sec = 0.0
-        idx = 0
-        while start_sec < duration_seconds:
-            end_sec = min(start_sec + 20.0, duration_seconds)
-            start_sample = int(start_sec * 16000)
-            end_sample = int(end_sec * 16000)
-            chunk_audio = audio[start_sample:end_sample]
-            
-            if len(chunk_audio) < 160:
-                break
-                
-            logger.info(f"Transcribing chunk {idx+1}: {start_sec:.2f}s - {end_sec:.2f}s...")
-            chunk_text = transcribe_audio_tensor(chunk_audio).strip()
-            
-            if chunk_text:
-                segments.append({
-                    "id": idx,
-                    "start": start_sec,
-                    "end": end_sec,
-                    "text": chunk_text,
-                    "speaker": None,
-                    "avg_logprob": 0.0
-                })
-            idx += 1
-            start_sec += 20.0
-            
-    response_data = {
-        "text": " ".join(seg.get("text", "").strip() for seg in segments).strip(),
-        "duration": duration_seconds,
-        "language": "ru", # GigaAM is Russian-only
-        "segments": segments
-    }
-    return response_data
+    return run_pipeline(
+        file_path,
+        diarize=should_diarize,
+        language=language,
+        onnx_dir=GIGAAM_ONNX_DIR,
+        model_version=GIGAAM_MODEL_NAME,
+        align_model=GIGAAM_ALIGN_MODEL,
+        cache_dir="/app/data",
+        hf_token=HF_TOKEN,
+        batch_size=GIGAAM_BATCH_SIZE,
+        diarize_batch_size=GIGAAM_DIARIZE_BATCH_SIZE,
+        denoise_enabled=GIGAAM_DENOISE,
+        denoise_model=GIGAAM_DENOISE_MODEL,
+        denoise_device=GIGAAM_DENOISE_DEVICE,
+        denoise_chunk_sec=GIGAAM_DENOISE_CHUNK_SEC,
+        denoise_overlap_sec=GIGAAM_DENOISE_OVERLAP_SEC,
+    )
 
-from pydantic import BaseModel
 
 class LocalTranscribeRequest(BaseModel):
     file_path: str
@@ -327,70 +182,95 @@ class LocalTranscribeRequest(BaseModel):
     response_format: str = "json"
     diarize: str = "false"
 
+
 @app.post("/v1/audio/transcriptions/local")
 async def transcribe_local(
     req: LocalTranscribeRequest,
     _auth: None = Depends(require_internal_service),
+    _ready: None = Depends(require_models_ready),
 ):
     logger.info("Received local transcription request, diarize: %s", req.diarize)
+    _ensure_diarization_available(req.diarize)
     try:
         safe_path = validate_shared_path(req.file_path)
     except ValueError:
         raise HTTPException(status_code=400, detail="File not found on shared storage")
     try:
-         result = process_transcription_from_file(
-             safe_path,
-             req.language,
-             req.response_format,
-             req.diarize
-         )
-         return JSONResponse(content=result)
+        async with PIPELINE_LOCK:
+            result = await asyncio.to_thread(
+                process_transcription_from_file,
+                safe_path,
+                req.language,
+                req.response_format,
+                req.diarize,
+            )
+        return JSONResponse(content=result)
     except Exception as e:
-         logger.error("Error during local transcription: %s", e, exc_info=True)
-         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Transcription failed")
+        logger.error("Error during local transcription: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Transcription failed",
+        )
+
 
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     response_format: str = Form("json"),
-    diarize: str = Form("false")
+    diarize: str = Form("false"),
+    _ready: None = Depends(require_models_ready),
 ):
-    logger.info(f"Processing transcription request for file: {file.filename}, diarize: {diarize}")
-    
-    # Save upload file bytes to a temporary WAV file
+    logger.info("Processing transcription for %s, diarize: %s", file.filename, diarize)
+    _ensure_diarization_available(diarize)
     suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
         content = await file.read()
         tmp_file.write(content)
         tmp_path = tmp_file.name
-        
+
     try:
-        result = process_transcription_from_file(
-            tmp_path,
-            language,
-            response_format,
-            diarize
-        )
+        async with PIPELINE_LOCK:
+            result = await asyncio.to_thread(
+                process_transcription_from_file,
+                tmp_path,
+                language,
+                response_format,
+                diarize,
+            )
         return JSONResponse(content=result)
-        
     except Exception as e:
         logger.error("Error during transcription: %s", e, exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Transcription failed")
-        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Transcription failed",
+        )
     finally:
-        # Clean up temporary audio file
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
 
+
+@app.post("/unload")
+async def unload_models(_auth: None = Depends(require_internal_service)):
+    logger.info("UNLOAD: clearing pipeline model caches...")
+    reset_diarization_pipeline()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    return {"status": "unloaded"}
+
+
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "device": str(DEVICE),
-        "gigaam_model_loaded": gigaam_model is not None,
-        "diarize_pipeline_loaded": diarize_pipeline is not None
-    }
+    body = STATE.to_health_dict(
+        device=str(DEVICE),
+        onnx_dir=GIGAAM_ONNX_DIR,
+        denoise_enabled=GIGAAM_DENOISE,
+    )
+    if STATE.ready and STATE.status == "healthy":
+        return JSONResponse(status_code=status.HTTP_200_OK, content=body)
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=body)

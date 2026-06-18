@@ -24,7 +24,13 @@ docker-compose.override.yml
 
 # Large directories / Application data
 data/
-certs/
+# Ignore local cert material, but keep the corporate-CA staging dir (Scenario S3) so the
+# Docker build context always has certs/extra-ca/ (else `COPY certs/extra-ca/` fails the build).
+certs/*
+!certs/README.md
+!certs/extra-ca/
+!certs/extra-ca/.gitkeep
+!certs/extra-ca/*.crt
 pgdata/
 model_cache/
 
@@ -35,6 +41,8 @@ model_cache/
 test_results/
 tets_data/
 test_data/
+.tmp_*
+.tmp_*/
 
 # Private operations (SSH deploy, remote diagnostics, internal runbooks)
 DEPLOYMENT_INFO.md
