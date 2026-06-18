@@ -31,16 +31,16 @@ Edit `.env`: set `HF_TOKEN`, `ADMIN_KEY`, `POSTGRES_PASSWORD`, `API_PUBLIC_HOST`
 ./start.sh --build
 ```
 
-3. **Check health**
+3. **Check health** — nginx serves TLS on **both** ports (`listen ... ssl`) and self-signs a localhost cert on first boot, so use **HTTPS with `-k`** locally:
 
 ```bash
-curl -s "http://localhost:${PROXY_PORT_HTTP:-80}/health"
+curl -sk "https://localhost:${PROXY_PORT_HTTPS:-443}/health"
 ```
 
 4. **Submit a transcription job**
 
 ```bash
-curl -X POST "http://localhost:${PROXY_PORT_HTTP:-80}/v1/audio/transcriptions/async" \
+curl -k -X POST "https://localhost:${PROXY_PORT_HTTPS:-443}/v1/audio/transcriptions/async" \
   -H "Authorization: Bearer <your_api_key>" \
   -F "file=@/path/to/audio.wav" \
   -F "model=whisperx" \

@@ -101,7 +101,7 @@ WhisperX loads ASR weights with `local_files_only=True` and alignment weights wi
 
 **Option A — bake at image build (recommended for production):**
 
-In [`whisperx/Dockerfile`](whisperx/Dockerfile), uncomment:
+In [`whisperx/Dockerfile`](whisperx/Dockerfile), add the prefetch step after the `COPY whisperx/download_models.py .` line and before `USER whisperx`:
 
 ```dockerfile
 RUN python download_models.py
@@ -165,16 +165,22 @@ Set `HF_TOKEN` in `.env` (runtime Pyannote prefetch / diarization).
 
 On **first start**, wait for `gigaam-service` health **healthy** (model bootstrap into `gigaam_model_cache`). Rebuilding the image does not re-download models if the volume is preserved.
 
+> **First-run download on direct internet (S1):** `gigaam-service` sits only on the internal `inference_net` (no egress). If the cold-start bootstrap logs `Temporary failure in name resolution` (check `docker logs oaitt-gigaam`), the volume can't be filled in place — run the **egress override** once, wait for `healthy`, then return to the strict stack (full details in §6 — S1):
+>
+> ```bash
+> docker compose -f docker-compose.yml -f docker-compose.bootstrap.yml up -d gigaam-service
+> ```
+
 If pip downloads time out during image build:
 
 ```bash
 DOCKER_BUILDKIT=1 docker compose build --network=host gigaam-service
 ```
 
-Check health (replace port if you changed `PROXY_PORT_HTTP`):
+Check health. **nginx serves TLS on both `PROXY_PORT_HTTP` and `PROXY_PORT_HTTPS`** (`listen ... ssl` in `nginx/nginx.conf`) and self-signs a localhost certificate on first boot, so use **HTTPS with `-k`** locally (replace the port if you changed `PROXY_PORT_HTTPS`):
 
 ```bash
-curl -s "http://localhost:${PROXY_PORT_HTTP:-80}/health"
+curl -sk "https://localhost:${PROXY_PORT_HTTPS:-443}/health"
 ```
 
 Expected: `"status": "healthy"` and at least one inference service `"online"`.
@@ -276,15 +282,16 @@ and [SECURITY.md](SECURITY.md#corporate-tls-interception-mitm).
 Use values from your `.env`. Example with defaults:
 
 ```bash
-# Upload (large files) — use API_UPLOAD_HOST and PROXY_PORT_HTTP
-curl -X POST "http://localhost:${PROXY_PORT_HTTP:-80}/v1/audio/transcriptions/async" \
+# Upload (large files) — use API_UPLOAD_HOST and PROXY_PORT_HTTPS.
+# Locally, nginx is TLS-only on both ports, so use HTTPS + -k.
+curl -k -X POST "https://localhost:${PROXY_PORT_HTTPS:-443}/v1/audio/transcriptions/async" \
   -H "Authorization: Bearer default-client-key" \
   -F "file=@/path/to/sample.wav" \
   -F "model=whisperx" \
   -F "diarize=false"
 
 # Status — via API_PUBLIC_HOST in production (localhost for local test)
-curl -s "http://localhost:${PROXY_PORT_HTTP:-80}/v1/audio/transcriptions/status/<job_id>" \
+curl -sk "https://localhost:${PROXY_PORT_HTTPS:-443}/v1/audio/transcriptions/status/<job_id>" \
   -H "Authorization: Bearer default-client-key"
 ```
 
